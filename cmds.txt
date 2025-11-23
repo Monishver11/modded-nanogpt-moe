@@ -1,0 +1,13 @@
+ssh cuda5
+
+cd ../../scratch/mc10322
+
+git clone git@github.com:Monishver11/modded-nanogpt-moe.git
+
+cd modded-nanogpt-moe
+
+conda create -n nanogpt python=3.10 -y
+
+conda activate nanogpt
+
+pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124
