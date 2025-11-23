@@ -1156,25 +1156,27 @@ hidden_matrix_params = [p for n, p in model.blocks.named_parameters()
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
-gate_params = [p for n, p in model.named_parameters() if "gate" in n or "router" in n]
+
+# Router and gate params go to Adam (optimizer1)
+gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+router_params = [p for n, p in model.named_parameters() if "router" in n]
 
 # init the optimizer(s)
 optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params,
+    scalar_params + head_params + embed_params + gate_params + router_params,  # Add router here
     lr=0.008,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
 optimizer2 = NorMuon(
-    hidden_matrix_params + gate_params,  # gate_params now includes router
+    hidden_matrix_params,  # Only large matrices (expert weights, attention, etc.)
     lr=0.03, 
     momentum=0.95, 
     beta2=0.95, 
     weight_decay=1.2,
     custom_sizing=False
 )
-
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
