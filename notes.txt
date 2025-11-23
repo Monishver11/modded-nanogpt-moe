@@ -15,7 +15,13 @@ Now:
         - peak memory allocated: 4331 MiB reserved: 4546 MiB
 - Understand MOE - the math and internal workings
 - Baseline MOE Implementation within train_gpt
+    - Same setting as above;
+    - Results:
+        - GPU Memory Usage: 10650MiB
+        - step:12000/12000 val_loss:4.4433 train_time:3689380ms step_avg:307.45ms
+        - peak memory allocated: 8382 MiB reserved: 10448 MiB
 - What are variations of MOE kernels available and their internal workings
+- Custom MoE kernels
 
 Impeding problems to solve:
 - Find a routing mechanism that simultaneously improves both expert utilization and specialization (Chi et al., 2022; Qiu et al., 2025). This matters because we want to improve performance by adding hundreds or even thousands of experts, but router inefficiency seems to become more troublesome with more experts. As the core component of the MoE system, if the router collapses, the MoE scaling advantages can vanish entirely.
@@ -23,3 +29,4 @@ Impeding problems to solve:
 References (Read):
 - https://www.cerebras.ai/blog/moe-guide-why-moe
 - https://www.cerebras.ai/blog/moe-guide-router
+- https://www.cerebras.ai/blog/moe-guide-debug - (Load balancing MOE in modded-nanogpt)
