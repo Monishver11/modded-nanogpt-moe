@@ -662,6 +662,9 @@ class MoEMLP(nn.Module):
         B, T, D = x.shape
         assert D == self.dim
         
+        # Store input dtype for consistency
+        input_dtype = x.dtype
+        
         # Compute router logits and probabilities
         router_logits = self.router(x)  # [B, T, num_experts]
         router_probs = F.softmax(router_logits, dim=-1)  # [B, T, num_experts]
@@ -679,20 +682,20 @@ class MoEMLP(nn.Module):
         # Process each expert WITHOUT data-dependent branching
         for expert_idx in range(self.num_experts):
             # Create mask for tokens assigned to this expert
-            expert_mask = (expert_ids_flat == expert_idx).float()  # [B*T] - use float for masking
+            # Use float mask to avoid data-dependent branching
+            expert_mask = (expert_ids_flat == expert_idx).to(input_dtype)  # [B*T]
             
-            # Always process all tokens, but mask out non-assigned ones
-            # This avoids data-dependent control flow
-            
-            # Forward through this expert's MLP
+            # Always process all tokens through this expert
+            # Forward through this expert's MLP (same as original MLP structure)
             h = F.linear(x_flat, self.expert_fc[expert_idx].T.type_as(x_flat))
-            h = F.relu(h).square()
+            h = F.relu(h).square()  # ReLU^2 activation
             expert_output = F.linear(h, self.expert_proj[expert_idx].type_as(h))  # [B*T, D]
             
             # Mask and accumulate: only add output for tokens assigned to this expert
+            # expert_mask: [B*T] -> [B*T, 1] for broadcasting
             output_flat = output_flat + expert_output * expert_mask.unsqueeze(-1)
         
-        # Reshape back
+        # Reshape back to original shape
         output = output_flat.view(B, T, D)
         
         # Compute auxiliary load balancing loss if requested
@@ -700,10 +703,12 @@ class MoEMLP(nn.Module):
             # Encourage uniform expert usage
             avg_expert_probs = router_probs.mean(dim=(0, 1))  # [num_experts]
             
-            # Entropy-based loss
+            # Entropy-based loss: maximize entropy to encourage uniform distribution
             eps = 1e-10
             aux_loss = -torch.sum(avg_expert_probs * torch.log(avg_expert_probs + eps))
+            # Normalize by max possible entropy
             aux_loss = aux_loss / math.log(self.num_experts)
+            # Convert to minimization objective (1 - normalized_entropy)
             aux_loss = 1.0 - aux_loss
             
             return output, aux_loss
