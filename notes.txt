@@ -10,5 +10,16 @@ Now:
     - Each step = 4096 tokens ⇒ total training tokens ≈ 4096 * 12_000 ≈ 49M tokens.
     - train_batch_size: int = 4096 & train_max_seq_len: int = 1024
     - Training on 4096 tokens per step, for 12,000 steps, i.e., about 49M tokens total, with sequences capped at 1024 tokens each, and a learning rate that stays high for the first half of training and then gradually decays over the second half. Validation checks use 524k tokens in chunks of 4096 tokens per val step.
+    - Results: 
+        - step:12000/12000 val_loss:4.5076 train_time:1695644ms step_avg:141.30ms
+        - peak memory allocated: 4331 MiB reserved: 4546 MiB
 - Understand MOE - the math and internal workings
+- Baseline MOE Implementation within train_gpt
 - What are variations of MOE kernels available and their internal workings
+
+Impeding problems to solve:
+- Find a routing mechanism that simultaneously improves both expert utilization and specialization (Chi et al., 2022; Qiu et al., 2025). This matters because we want to improve performance by adding hundreds or even thousands of experts, but router inefficiency seems to become more troublesome with more experts. As the core component of the MoE system, if the router collapses, the MoE scaling advantages can vanish entirely.
+
+References (Read):
+- https://www.cerebras.ai/blog/moe-guide-why-moe
+- https://www.cerebras.ai/blog/moe-guide-router
