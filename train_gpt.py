@@ -673,7 +673,12 @@ class GPT(nn.Module):
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
-        pad = (-num_layers * 5 - 2) % dist.get_world_size()
+        # Single GPU: no distributed padding needed
+        if dist.is_available() and dist.is_initialized():
+            ws = dist.get_world_size()
+        else:
+            ws = 1
+        pad = (-num_layers * 5 - 2) % ws  # will be 0 when ws == 1
         self.scalars = nn.Parameter(
             torch.cat(
                 [
@@ -1074,9 +1079,9 @@ def get_lr(step: int):
 def get_ws(step: int):
     # set short window size to half of long window size
     # on final step return specific ws for validation
-    if step == args.num_iterations:
-        return args.ws_validate // 2, args.ws_validate
-    x = min(step / (1 + args.num_scheduled_iterations), 0.9999)
+    if step >= args.num_scheduled_iterations:
+        return args.ws_final // 2, args.ws_final
+    x = step / args.num_scheduled_iterations
     assert 0 <= x < 1
     ws_idx = int(len(args.ws_schedule) * x)
     return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
@@ -1143,7 +1148,7 @@ for step in range(warmup_steps):
         ws_long = args.ws_schedule[0]
     else:
         new_ws_long = args.ws_schedule[ws_idx]  
-        if new_ws_long > ws_long:
+        if new_ws_long != ws_long:
             model.yarn.apply(ws_long, new_ws_long)
             ws_long = new_ws_long
     model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
