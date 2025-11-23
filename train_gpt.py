@@ -611,7 +611,7 @@ class CausalSelfAttention(nn.Module):
 class MoEMLP(nn.Module):
     """
     Mixture of Experts MLP with top-1 routing.
-    Compatible with NorMuon optimizer and torch.compile.
+    Compatible with NorMuon optimizer and torch.compile (no data-dependent branching).
     """
     def __init__(self, dim: int, num_experts: int = 4):
         super().__init__()
@@ -621,7 +621,7 @@ class MoEMLP(nn.Module):
         
         # Router: maps from dim to num_experts logits
         self.router = nn.Linear(dim, num_experts, bias=False)
-        self.router.weight.label = 'moe_router'  # for optimizer grouping
+        self.router.weight.label = 'moe_router'
         
         # Initialize router to zeros for uniform routing at start
         with torch.no_grad():
@@ -667,61 +667,48 @@ class MoEMLP(nn.Module):
         router_probs = F.softmax(router_logits, dim=-1)  # [B, T, num_experts]
         
         # Top-1 routing: select expert with highest probability for each token
-        expert_ids = torch.argmax(router_probs, dim=-1)  # [B, T]
+        expert_weights, expert_ids = torch.max(router_probs, dim=-1)  # [B, T], [B, T]
         
-        # Initialize output tensor
-        output = torch.zeros_like(x)  # [B, T, dim]
+        # Flatten for easier processing
+        x_flat = x.view(B * T, D)  # [B*T, D]
+        expert_ids_flat = expert_ids.view(B * T)  # [B*T]
         
-        # Process each expert
+        # Initialize output (will accumulate expert outputs)
+        output_flat = torch.zeros_like(x_flat)  # [B*T, D]
+        
+        # Process each expert WITHOUT data-dependent branching
         for expert_idx in range(self.num_experts):
             # Create mask for tokens assigned to this expert
-            expert_mask = (expert_ids == expert_idx)  # [B, T]
+            expert_mask = (expert_ids_flat == expert_idx).float()  # [B*T] - use float for masking
             
-            # Count tokens for this expert
-            num_tokens = expert_mask.sum()
-            
-            if num_tokens == 0:
-                continue  # Skip if no tokens assigned to this expert
-            
-            # Gather tokens for this expert
-            # Use nonzero to get indices, then index_select
-            flat_mask = expert_mask.view(-1)  # [B*T]
-            token_indices = flat_mask.nonzero(as_tuple=True)[0]  # [num_tokens]
-            
-            x_flat = x.view(B * T, D)  # [B*T, dim]
-            expert_input = x_flat[token_indices]  # [num_tokens, dim]
+            # Always process all tokens, but mask out non-assigned ones
+            # This avoids data-dependent control flow
             
             # Forward through this expert's MLP
-            # Same structure as original MLP: dim -> 4*dim -> dim
-            h = F.linear(expert_input, self.expert_fc[expert_idx].T.type_as(expert_input))
-            h = F.relu(h).square()  # Same activation as original
-            expert_output = F.linear(h, self.expert_proj[expert_idx].type_as(h))
+            h = F.linear(x_flat, self.expert_fc[expert_idx].T.type_as(x_flat))
+            h = F.relu(h).square()
+            expert_output = F.linear(h, self.expert_proj[expert_idx].type_as(h))  # [B*T, D]
             
-            # Scatter expert output back to original positions
-            output_flat = output.view(B * T, D)  # [B*T, dim]
-            output_flat[token_indices] = expert_output
-            output = output_flat.view(B, T, D)
+            # Mask and accumulate: only add output for tokens assigned to this expert
+            output_flat = output_flat + expert_output * expert_mask.unsqueeze(-1)
+        
+        # Reshape back
+        output = output_flat.view(B, T, D)
         
         # Compute auxiliary load balancing loss if requested
         if return_aux_loss:
             # Encourage uniform expert usage
-            # Average router probability per expert across batch
             avg_expert_probs = router_probs.mean(dim=(0, 1))  # [num_experts]
             
-            # Entropy-based loss: maximize entropy = minimize negative entropy
-            # H = -sum(p * log(p))
-            # We want to maximize this, so we return negative
+            # Entropy-based loss
             eps = 1e-10
             aux_loss = -torch.sum(avg_expert_probs * torch.log(avg_expert_probs + eps))
-            # Normalize by max entropy (log(num_experts))
             aux_loss = aux_loss / math.log(self.num_experts)
-            # Return as minimization objective (1 - normalized_entropy)
             aux_loss = 1.0 - aux_loss
             
             return output, aux_loss
         
         return output
-
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
