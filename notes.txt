@@ -1,0 +1,14 @@
+TODO:
+
+Implement differnt MOE kernels and its ablation studies
+
+New highly optimized and efficient MOE kernel design and execution
+
+Now:
+- Can increase the batch size, current setting uses 1/2 of total memory. To get the val loss of 3.28;
+    - For num_iterations = total training steps = 11,500 + 500 = 12,000 steps. 
+    - Each step = 4096 tokens ⇒ total training tokens ≈ 4096 * 12_000 ≈ 49M tokens.
+    - train_batch_size: int = 4096 & train_max_seq_len: int = 1024
+    - Training on 4096 tokens per step, for 12,000 steps, i.e., about 49M tokens total, with sequences capped at 1024 tokens each, and a learning rate that stays high for the first half of training and then gradually decays over the second half. Validation checks use 524k tokens in chunks of 4096 tokens per val step.
+- Understand MOE - the math and internal workings
+- What are variations of MOE kernels available and their internal workings
