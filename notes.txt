@@ -20,6 +20,12 @@ Now:
         - GPU Memory Usage: 10650MiB
         - step:12000/12000 val_loss:4.4433 train_time:3689380ms step_avg:307.45ms
         - peak memory allocated: 8382 MiB reserved: 10448 MiB
+- Baseline MOE V2 - With Auxiliary Loss for Expert Load Balancing 
+    - Same setting as above;
+        - Results:
+            - step:12000/12000 val_loss:10.8370 train_time:3760382ms step_avg:313.37ms
+            - peak memory allocated: 8383 MiB reserved: 10648 MiB
+            - Validation loss is increasing, need to resolve this bug.
 - What are variations of MOE kernels available and their internal workings
 - Custom MoE kernels
 
@@ -30,3 +36,104 @@ References (Read):
 - https://www.cerebras.ai/blog/moe-guide-why-moe
 - https://www.cerebras.ai/blog/moe-guide-router
 - https://www.cerebras.ai/blog/moe-guide-debug - (Load balancing MOE in modded-nanogpt)
+
+
+
+
+
+Notes for MOE_V2 (From Cerebras Technical Blog):
+
+# What We've Built: From Baseline to Enhanced MoE;
+
+We started with a baseline Mixture-of-Experts (MoE) implementation for the modded-nanogpt project and enhanced it with sophisticated load balancing mechanisms inspired by Google's Switch Transformer and the Cerebras MoE debugging guide. The journey from dense model to enhanced MoE involves several fundamental transformations in how the model processes information and learns.
+
+# The Core Concept: Sparse Computation;
+
+Traditional neural networks use every parameter for every input token, which is computationally expensive. MoE models introduce sparsity by having multiple "expert" networks and routing each token to only one expert (in our top-1 routing scheme). Think of it like a hospital triage system: instead of every patient seeing every doctor, patients are routed to specialists based on their symptoms. This allows the model to have more total parameters while keeping per-token computation constant.
+In our implementation, we replaced the dense MLP layers in the GPT architecture with MoE layers. Each MoE layer contains four expert networks, and a learned router decides which expert should process each token. The router is a simple linear layer that maps from the model's hidden dimension (768) to a probability distribution over the four experts. For each token, we select the expert with the highest probability and route that token exclusively to that expert.
+
+# The Load Balancing Challenge;
+
+The critical problem we addressed in the enhanced version is load balancing. Without careful design, MoE models suffer from a collapse where the router learns to send most or all tokens to just one or two "favorite" experts, leaving the others unused. This defeats the entire purpose of having multiple experts because you're essentially back to a dense model but with wasted parameters. Imagine if hospital triage sent every patient to the same doctor regardless of their condition - the other doctors would stand idle, and the system would be inefficient.
+This collapse happens because of a feedback loop during training: if one expert happens to perform slightly better initially (due to random initialization), the router learns to send more tokens to it. As that expert sees more data, it improves further, making the router even more confident in choosing it. Meanwhile, the other experts receive fewer tokens, learn less, and fall further behind. This is analogous to the "rich get richer" phenomenon in economics.
+
+# Three-Pronged Auxiliary Loss Strategy;
+
+To combat this collapse, we introduced three auxiliary loss terms that work together to encourage balanced and stable routing:
+
+Load Balancing Loss is our primary defense against expert collapse. This loss term, derived from the Switch Transformer paper, explicitly penalizes imbalanced routing. It computes two quantities for each expert: the fraction of tokens actually routed to it (hard assignments) and the average router probability for that expert across all tokens (soft assignments). The loss is the dot product of these two vectors, scaled by the number of experts. When routing is perfectly balanced, each expert receives exactly 1/num_experts of the tokens and has average probability 1/num_experts, making the loss 1.0. When routing is imbalanced, this loss increases, creating a gradient signal that pushes the router toward more uniform distributions.
+
+Mathematically, if expert i receives a fraction f_i of tokens and has average router probability P_i, the loss is: num_experts × Σ(f_i × P_i). This formulation is clever because it creates gradients even during the forward pass through the router's softmax. The router learns that to minimize this loss, it must spread tokens more evenly across experts.
+
+Router Z-Loss addresses a numerical stability issue. Router logits can grow unbounded during training, especially if some experts become strongly preferred. Large logits lead to very sharp softmax distributions (probabilities near 0 or 1), which can cause gradient flow problems and make training unstable. The z-loss is the squared log-sum-exp of the router logits, averaged over all tokens. This penalizes large logit magnitudes, keeping the router's confidence moderate rather than extreme. We apply a small weight (0.001) to this loss because we want to encourage stability without overly constraining the router's ability to make confident decisions when appropriate.
+
+Importance Loss provides an alternative perspective on load balancing by measuring the variance in expert importance scores. Importance is computed as the sum of router probabilities for each expert across all tokens in the batch. High variance means some experts are strongly preferred overall, while low variance indicates balanced attention. By penalizing variance, we encourage a more democratic distribution of the router's "attention" across experts.
+
+# Router Initialization Strategy;
+
+We made a subtle but important change to router initialization. The baseline version initialized the router weights to zero, which meant all experts initially had equal probability (uniform distribution after softmax). While this sounds good, it doesn't actually help with load balancing during early training. With zero initialization, small random fluctuations in gradients can quickly break the symmetry and lead one expert to dominate.
+Instead, we initialize the router with small random values drawn from a normal distribution (mean=0, std=0.01). This creates slight initial preferences for different experts for different token positions, but these preferences are weak enough that they can be overridden by learning. Combined with our auxiliary losses, this initialization helps the router explore different routing patterns early in training rather than quickly collapsing to a single dominant expert.
+
+# Integration with the Training Loop;
+
+The auxiliary losses integrate seamlessly into the existing training pipeline. Each MoE layer's forward pass now returns both its output and a dictionary of auxiliary loss components. As the forward pass proceeds through the model's 12 transformer blocks, we accumulate these auxiliary losses from each MoE layer (11 layers have MoE, since layer 0 skips the MLP entirely). We then average the auxiliary losses across layers and add them to the main cross-entropy loss with a small weight (0.01 by default).
+This weight is crucial for balancing objectives. The main task is next-token prediction (cross-entropy loss), and we don't want load balancing to interfere too much with learning good language representations. A weight of 0.01 means we're willing to tolerate a small increase in perplexity (worse language modeling) in exchange for much better load balancing. This trade-off is tunable via the moe_aux_loss_weight hyperparameter.
+
+# Compatibility with Existing Infrastructure;
+
+A key design goal was maintaining compatibility with the existing modded-nanogpt infrastructure, particularly the custom NorMuon optimizer. NorMuon applies polar decomposition to orthogonalize weight updates for large 2D parameter matrices. Our expert weights (expert_fc and expert_proj) are labeled as 'mlp' parameters, so they get processed by NorMuon just like the original dense MLP weights. The router weights, being smaller, are labeled as 'moe_router' and handled by the Adam optimizer along with other small parameters like layer scalars and gates.
+We also ensured compatibility with torch.compile by avoiding data-dependent control flow. Instead of conditionally skipping experts with no assigned tokens, we always process all tokens through all experts but use masking to zero out contributions from non-assigned tokens. This is less efficient than sparse computation (we're doing num_experts times more work than necessary), but it's required for compilation and actually performs well on GPUs due to better parallelization.
+
+# Single GPU Adaptations;
+
+The entire implementation runs on a single NVIDIA GeForce RTX 4070 (12GB VRAM), which required several adaptations from the original 8×H100 setup. We removed all distributed training code (torch.distributed calls), simplified the optimizers to work without gradient sharding, replaced Flash Attention 3 (H100-only) with PyTorch's native scaled_dot_product_attention, and disabled FP8 matrix multiplication (which is optimized for Hopper architecture) in favor of bfloat16 throughout.
+The batch sizes were dramatically reduced to fit in 12GB VRAM. The original training used 262,144 tokens per batch across 8 GPUs; we use 4,096 tokens per batch on a single GPU, which is about 64× smaller per GPU. We compensated somewhat by increasing the total number of training iterations from ~2,200 to ~12,000, though this still results in seeing fewer total tokens than the original setup.
+
+# Training Configuration;
+
+Batch size: 4,096 tokens per batch
+Sequence length: up to 1,024 tokens (with variable-length sequences via BOS alignment)
+Gradient accumulation: 1 step (no accumulation on single GPU)
+Training iterations: 12,000 steps
+Total tokens processed: 4,096 × 12,000 = 49,152,000 tokens (~49M tokens)
+
+# Model Size and Parameter Count;
+
+Let's break down the exact parameter count of our MoE model:
+    Embedding Layers:
+
+    Token embeddings: 50,304 (vocab) × 768 (dim) = 38,633,472 parameters
+    Three value embeddings: 3 × 38,633,472 = 115,900,416 parameters
+    Total embeddings: 154,533,888 parameters
+
+Per-Layer Components:
+    For each of the 12 transformer blocks:
+    Attention (10 blocks have attention, layers 0 and 7 skip it):
+
+    QKV+O merged weights: 768 × (768×4) = 2,359,296 parameters per layer
+    Attention gate: 12 × 6 (heads) = 72 parameters per layer
+    Total per attention layer: 2,359,368 parameters
+    Total attention across 10 layers: 23,593,680 parameters
+
+MoE MLP (11 blocks have MLP, layer 0 skips it):
+
+    Router: 768 × 4 (experts) = 3,072 parameters per layer
+    Each expert has two matrices:
+
+    expert_fc: 768 × (4×768) = 2,359,296 parameters
+    expert_proj: 768 × (4×768) = 2,359,296 parameters
+
+
+    Per expert: 4,718,592 parameters
+    Per MoE layer: 4 experts × 4,718,592 + 3,072 (router) = 18,877,440 parameters
+    Total MoE across 11 layers: 207,561,840 parameters
+
+Other Components:
+
+    Smear gate: 12 × 1 = 12 parameters
+    LM head: 768 × 50,304 = 38,633,472 parameters
+    Scalars (skip weights, lambdas, etc.): ~150 parameters
+    Total other: 38,633,634 parameters
+
+Grand Total: ~424 million parameters;
+This is significantly larger than the original dense GPT-2 small (124M parameters) because we have 4× the MLP parameters (four experts instead of one dense MLP). However, due to top-1 routing, only about 150M parameters are active for any given token (embeddings + attention + one expert per layer).

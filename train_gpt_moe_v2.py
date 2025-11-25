@@ -627,9 +627,8 @@ class MoEMLP(nn.Module):
         self.router = nn.Linear(dim, num_experts, bias=False)
         self.router.weight.label = 'moe_router'
         
-        # Initialize router with small random values for better initial distribution
         with torch.no_grad():
-            self.router.weight.normal_(mean=0.0, std=0.01)
+            self.router.weight.zero_()  # Back to uniform routing initially
         
         # Create experts
         self.expert_fc = nn.ParameterList([
@@ -705,17 +704,26 @@ class MoEMLP(nn.Module):
         # Following Switch Transformer paper: aux_loss = num_experts * sum(f_i * P_i)
         # where f_i = fraction of tokens assigned to expert i
         # and P_i = average router probability for expert i
-        
-        # Fraction of tokens routed to each expert
-        num_tokens = B * T
-        fraction_per_expert = expert_counts / num_tokens  # [num_experts]
-        
-        # Average router probability per expert across all tokens
+
+        # Compute load balancing loss properly
+        # f_i = fraction of tokens routed to expert i (from hard assignments)
+        # P_i = mean router probability for expert i (from soft assignments)
+
+        # One-hot encoding of expert assignments
+        expert_mask_one_hot = F.one_hot(expert_ids, num_classes=self.num_experts)  # [B, T, num_experts]
+        expert_mask_one_hot = expert_mask_one_hot.float()
+
+        # Fraction of tokens per expert (no gradient)
+        tokens_per_expert = expert_mask_one_hot.sum(dim=(0, 1))  # [num_experts]
+        fraction_per_expert = tokens_per_expert / (B * T)
+
+        # Average router probability per expert (has gradient)
         avg_router_prob_per_expert = router_probs.mean(dim=(0, 1))  # [num_experts]
-        
-        # Load balancing loss (Switch Transformer formulation)
+
+        # Load balancing loss (encourage uniform distribution)
+        # Minimum is when both fractions and probabilities are 1/num_experts
         load_balancing_loss = self.num_experts * torch.sum(
-            fraction_per_expert * avg_router_prob_per_expert
+            fraction_per_expert.detach() * avg_router_prob_per_expert
         )
         
         # 2. Router Z-Loss (encourages router logits to stay small for stability)
@@ -914,6 +922,14 @@ class GPT(nn.Module):
             if i == backout_layer:
                 x_backout = x
 
+        # In GPT.forward, after the layer loop
+        if self.training and step % 100 == 0:
+            # expert_usage is accumulated across layers
+            expert_distribution = expert_usage / expert_usage.sum()
+            print(f"Step {step} - Expert distribution: {expert_distribution.cpu().numpy()}")
+            # Should be roughly [0.25, 0.25, 0.25, 0.25] for 4 experts
+            # If it's like [0.8, 0.1, 0.05, 0.05], you have collapse
+
         # Average auxiliary loss across MoE layers
         if moe_layer_count > 0:
             total_aux_loss = total_aux_loss / moe_layer_count
@@ -933,8 +949,11 @@ class GPT(nn.Module):
         
         # Combine main loss with auxiliary loss
         # Use a weight for aux loss (typically 0.01 - 0.1)
-        aux_loss_weight = 0.01
-        total_loss = ce_loss + aux_loss_weight * total_aux_loss
+        aux_loss_weight = 0.001
+        if self.training and moe_layer_count > 0:
+            total_loss = ce_loss + aux_loss_weight * total_aux_loss
+        else:
+            total_loss = ce_loss  # No aux loss during validation
         
         return total_loss
 
@@ -1148,7 +1167,7 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20
 
     # MoE-specific hyperparameters
-    moe_aux_loss_weight: float = 0.01  # Weight for auxiliary loss
+    moe_aux_loss_weight: float = 0.001  # Weight for auxiliary loss
     moe_num_experts: int = 4           # Number of experts
     moe_expert_capacity_factor: float = 1.25  # Capacity factor for token dropping
 
