@@ -881,13 +881,9 @@ class GPT(nn.Module):
         x_backout = None
         backout_layer = 8
         
-        # Accumulate auxiliary losses from MoE layers
+        # Accumulate MoE auxiliary losses
         total_aux_loss = 0.0
         moe_layer_count = 0
-        
-        # For logging (only during training)
-        if self.training:
-            expert_usage = torch.zeros(4, device=x.device)  # Assuming 4 experts
         
         # skip layer zero
         for i in range(1, len(self.blocks)):
@@ -911,24 +907,12 @@ class GPT(nn.Module):
             if aux_loss_dict is not None:
                 moe_layer_count += 1
                 total_aux_loss += aux_loss_dict['load_balancing_loss']
-                total_aux_loss += 0.001 * aux_loss_dict['router_z_loss']  # Small weight for z-loss
-                
-                # Track expert usage for logging
-                if self.training:
-                    expert_usage += aux_loss_dict['expert_counts']
+                total_aux_loss += 0.001 * aux_loss_dict['router_z_loss']
             
             if i < n:
                 skip_connections.append(x)
             if i == backout_layer:
                 x_backout = x
-
-        # In GPT.forward, after the layer loop
-        if self.training and step % 100 == 0:
-            # expert_usage is accumulated across layers
-            expert_distribution = expert_usage / expert_usage.sum()
-            print(f"Step {step} - Expert distribution: {expert_distribution.cpu().numpy()}")
-            # Should be roughly [0.25, 0.25, 0.25, 0.25] for 4 experts
-            # If it's like [0.8, 0.1, 0.05, 0.05], you have collapse
 
         # Average auxiliary loss across MoE layers
         if moe_layer_count > 0:
@@ -948,12 +932,10 @@ class GPT(nn.Module):
         )
         
         # Combine main loss with auxiliary loss
-        # Use a weight for aux loss (typically 0.01 - 0.1)
-        aux_loss_weight = 0.001
         if self.training and moe_layer_count > 0:
-            total_loss = ce_loss + aux_loss_weight * total_aux_loss
+            total_loss = ce_loss + args.moe_aux_loss_weight * total_aux_loss
         else:
-            total_loss = ce_loss  # No aux loss during validation
+            total_loss = ce_loss
         
         return total_loss
 
