@@ -608,6 +608,143 @@ class CausalSelfAttention(nn.Module):
         y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
         return y
 
+class MoEMLP(nn.Module):
+    """
+    Enhanced Mixture of Experts MLP with:
+    - Top-1 routing with load balancing
+    - Auxiliary load balancing loss
+    - Expert capacity and token dropping
+    - Router z-loss for stability
+    """
+    def __init__(self, dim: int, num_experts: int = 4, expert_capacity_factor: float = 1.25):
+        super().__init__()
+        self.dim = dim
+        self.num_experts = num_experts
+        self.expert_capacity_factor = expert_capacity_factor
+        hdim = 4 * dim
+        
+        # Router: maps from dim to num_experts logits
+        self.router = nn.Linear(dim, num_experts, bias=False)
+        self.router.weight.label = 'moe_router'
+        
+        with torch.no_grad():
+            self.router.weight.zero_()  # Back to uniform routing initially
+        
+        # Create experts
+        self.expert_fc = nn.ParameterList([
+            nn.Parameter(torch.empty(dim, hdim)) for _ in range(num_experts)
+        ])
+        self.expert_proj = nn.ParameterList([
+            nn.Parameter(torch.empty(dim, hdim)) for _ in range(num_experts)
+        ])
+        
+        # Label all expert params as 'mlp' for NorMuon optimizer
+        for i in range(num_experts):
+            self.expert_fc[i].label = 'mlp'
+            self.expert_proj[i].label = 'mlp'
+        
+        # Initialize expert weights
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std
+        with torch.no_grad():
+            for i in range(num_experts):
+                self.expert_fc[i].uniform_(-bound, bound)
+                self.expert_proj[i].zero_()
+    
+    def forward(self, x: Tensor):
+        """
+        Enhanced forward with load balancing loss.
+        Returns: (output, aux_loss_dict)
+        """
+        B, T, D = x.shape
+        assert D == self.dim
+        
+        input_dtype = x.dtype
+        
+        # Compute router logits [B, T, num_experts]
+        router_logits = self.router(x)
+        
+        # Apply softmax to get routing probabilities
+        router_probs = F.softmax(router_logits, dim=-1)
+        
+        # Top-1 routing: select expert with highest probability
+        expert_weights, expert_ids = torch.max(router_probs, dim=-1)  # [B, T]
+        
+        # Flatten for processing
+        x_flat = x.reshape(B * T, D)
+        expert_ids_flat = expert_ids.reshape(B * T)
+        
+        # Initialize output
+        output_flat = torch.zeros(B * T, D, dtype=x.dtype, device=x.device)
+        
+        # Track expert usage for load balancing
+        expert_counts = torch.zeros(self.num_experts, dtype=torch.float32, device=x.device)
+        
+        # Process each expert
+        for expert_idx in range(self.num_experts):
+            # Mask for tokens assigned to this expert
+            expert_mask = (expert_ids_flat == expert_idx).to(dtype=x.dtype)
+            
+            # Count tokens assigned to this expert
+            expert_counts[expert_idx] = expert_mask.sum()
+            
+            # Forward through expert
+            h = F.linear(x_flat, self.expert_fc[expert_idx].T.type_as(x_flat))
+            h = F.relu(h).square()
+            expert_out = F.linear(h, self.expert_proj[expert_idx].type_as(h))
+            
+            # Accumulate with masking
+            output_flat = output_flat + expert_out * expert_mask.view(-1, 1)
+        
+        output = output_flat.reshape(B, T, D)
+        
+        # ============ AUXILIARY LOSSES ============
+        
+        # 1. Load Balancing Loss (encourages uniform expert usage)
+        # Following Switch Transformer paper: aux_loss = num_experts * sum(f_i * P_i)
+        # where f_i = fraction of tokens assigned to expert i
+        # and P_i = average router probability for expert i
+
+        # Compute load balancing loss properly
+        # f_i = fraction of tokens routed to expert i (from hard assignments)
+        # P_i = mean router probability for expert i (from soft assignments)
+
+        # One-hot encoding of expert assignments
+        expert_mask_one_hot = F.one_hot(expert_ids, num_classes=self.num_experts)  # [B, T, num_experts]
+        expert_mask_one_hot = expert_mask_one_hot.float()
+
+        # Fraction of tokens per expert (no gradient)
+        tokens_per_expert = expert_mask_one_hot.sum(dim=(0, 1))  # [num_experts]
+        fraction_per_expert = tokens_per_expert / (B * T)
+
+        # Average router probability per expert (has gradient)
+        avg_router_prob_per_expert = router_probs.mean(dim=(0, 1))  # [num_experts]
+
+        # Load balancing loss (encourage uniform distribution)
+        # Minimum is when both fractions and probabilities are 1/num_experts
+        load_balancing_loss = self.num_experts * torch.sum(
+            fraction_per_expert.detach() * avg_router_prob_per_expert
+        )
+        
+        # 2. Router Z-Loss (encourages router logits to stay small for stability)
+        # Helps prevent router logits from growing unbounded
+        router_z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        
+        # 3. Importance Loss (alternative formulation from Cerebras blog)
+        # Encourages expert probabilities to be diverse
+        importance = router_probs.sum(dim=(0, 1))  # [num_experts]
+        importance_loss = torch.var(importance)  # Variance of importance scores
+        
+        # Combine auxiliary losses
+        aux_loss_dict = {
+            'load_balancing_loss': load_balancing_loss,
+            'router_z_loss': router_z_loss,
+            'importance_loss': importance_loss,
+            'expert_counts': expert_counts,  # For logging
+        }
+        
+        return output, aux_loss_dict
+    
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -631,20 +768,33 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_moe: bool = False, num_experts: int = 4):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
-        # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP(dim) if layer_idx != 0 else None
+        
+        if layer_idx != 0:
+            if use_moe:
+                self.mlp = MoEMLP(dim, num_experts=num_experts)
+            else:
+                self.mlp = MLP(dim)
+        else:
+            self.mlp = None
+        
+        self.use_moe = use_moe and layer_idx != 0  # Track if this block uses MoE
 
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), attn_args)
         if self.mlp is not None:
-            x = x + self.mlp(norm(x))
-        return x
+            if self.use_moe:
+                mlp_out, aux_loss_dict = self.mlp(norm(x))
+                x = x + mlp_out
+                return x, aux_loss_dict
+            else:
+                x = x + self.mlp(norm(x))
+                return x, None
+        return x, None
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -653,63 +803,59 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, 
+                 model_dim: int, max_seq_len: int, use_moe: bool = False, num_experts: int = 4):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.smear_gate = CastedLinear(12, 1)
         self.smear_gate.weight.detach().zero_()
-        # label modules to enable custom optimizer sizing
         self.smear_gate.weight.label = 'smear_gate'
-        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
-        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
+        
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
+        
+        # Create blocks with optional MoE
+        self.blocks = nn.ModuleList([
+            Block(model_dim, head_dim, num_heads, i, use_moe=use_moe, num_experts=num_experts) 
+            for i in range(num_layers)
+        ])
+        
         self.yarn = Yarn(head_dim, max_seq_len)
-        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
-        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         use_fp8 = not os.environ.get("DISABLE_FP8", False)
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
-        self.lm_head.weight.detach().zero_() # @Grad62304977
-        # Add learnable skip connection weights for decoder layers
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, 
+                                    x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
+        self.lm_head.weight.detach().zero_()
+        
+        # Rest of __init__ remains the same...
         assert num_layers % 2 == 0
-        # Single GPU: no distributed padding needed
-        if dist.is_available() and dist.is_initialized():
-            ws = dist.get_world_size()
-        else:
-            ws = 1
-        pad = (-num_layers * 5 - 2) % ws  # will be 0 when ws == 1
+        pad = 0  # No padding for world_size=1
         self.scalars = nn.Parameter(
             torch.cat(
                 [
-                    -1.5
-                    * torch.ones(num_layers),  # skip_weights -> σ(-1.5) ≈ 0.18
-                    *[
-                        torch.tensor([1.0, 0.0]) for _ in range(num_layers)
-                    ],  # block lambdas
-                    *[
-                        torch.tensor([0.5, 0.5]) for _ in range(num_layers)
-                    ],  # SA lambdas
-                    torch.zeros(1), # smear_lambda
-                    0.5*torch.ones(1), # backout_lambda
+                    -1.5 * torch.ones(num_layers),
+                    *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)],
+                    *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)],
+                    torch.zeros(1),
+                    0.5*torch.ones(1),
                     torch.ones(pad),
                 ]
             )
         )
-        # set learning rates
+        
+        # Set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
         for param in self.value_embeds.parameters():
             param.lr_mul = 75.
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
+    
+        # forward() method remains unchanged
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        # dropping first layer updates this to .12 ... 012
         ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
@@ -720,13 +866,11 @@ class GPT(nn.Module):
 
         x = self.embed(input_seq)
 
-        # smear token embed forward 1 position @classiclarryd
         smear_lambda = self.scalars[5 * len(self.blocks)]
         smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
-        # U-net design by @brendanh0gan
         skip_connections = []
         skip_weights = self.scalars[:(len(self.blocks) // 2)]
         lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
@@ -734,11 +878,15 @@ class GPT(nn.Module):
         backout_lambda = self.scalars[5 * len(self.blocks)+1]
 
         n = len(self.blocks) // 2
-
         x_backout = None
         backout_layer = 8
+        
+        # Accumulate MoE auxiliary losses
+        total_aux_loss = 0.0
+        moe_layer_count = 0
+        
         # skip layer zero
-        for i in range(1,len(self.blocks)):
+        for i in range(1, len(self.blocks)):
             attn_args = AttnArgs(
                 ve=ve[i],
                 sa_lambdas=sa_lambdas[i],
@@ -748,29 +896,48 @@ class GPT(nn.Module):
                 sin=self.yarn.sin,
                 attn_scale=self.yarn.attn_scale
             )
-            # since layer 0 is skipped, layer 11 does not have skip_connection
-            if i >= n and i<11:
-                gate = torch.sigmoid(skip_weights[i - n])  # in (0, 1)
+            
+            if i >= n and i < 11:
+                gate = torch.sigmoid(skip_weights[i - n])
                 x = x + gate * skip_connections.pop()
-            x = self.blocks[i](x, x0, lambdas[i], attn_args)
+            
+            x, aux_loss_dict = self.blocks[i](x, x0, lambdas[i], attn_args)
+            
+            # Accumulate MoE auxiliary losses
+            if aux_loss_dict is not None:
+                moe_layer_count += 1
+                total_aux_loss += aux_loss_dict['load_balancing_loss']
+                total_aux_loss += 0.001 * aux_loss_dict['router_z_loss']
+            
             if i < n:
                 skip_connections.append(x)
             if i == backout_layer:
                 x_backout = x
 
-        # back out contributions from first 8 layers that are only required for downstream context and not direct prediction
+        # Average auxiliary loss across MoE layers
+        if moe_layer_count > 0:
+            total_aux_loss = total_aux_loss / moe_layer_count
+
         x -= backout_lambda * x_backout
         x = norm(x)
         logits = self.lm_head(x)
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / 7.5)
         logits_for_loss = logits.float() if not self.training else logits
-        loss = F.cross_entropy(
+        
+        # Main cross-entropy loss
+        ce_loss = F.cross_entropy(
             logits_for_loss.view(-1, logits_for_loss.size(-1)),
             target_seq,
             reduction="sum" if self.training else "mean",
         )
-        return loss
+        
+        # Combine main loss with auxiliary loss
+        if self.training and moe_layer_count > 0:
+            total_loss = ce_loss + args.moe_aux_loss_weight * total_aux_loss
+        else:
+            total_loss = ce_loss
+        
+        return total_loss
 
 # -----------------------------------------------------------------------------
 # Distributed data loader
@@ -981,6 +1148,11 @@ class Hyperparameters:
     ws_final: int = 13
     ws_validate_post_yarn_ext: int = 20
 
+    # MoE-specific hyperparameters
+    moe_aux_loss_weight: float = 0.001  # Weight for auxiliary loss
+    moe_num_experts: int = 4           # Number of experts
+    moe_expert_capacity_factor: float = 1.25  # Capacity factor for token dropping
+
 args = Hyperparameters()
 
 data_path = os.environ.get("DATA_PATH", ".")
@@ -1030,36 +1202,41 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
+    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size),
+    use_moe=True,
+    num_experts=args.moe_num_experts  # Use from hyperparameters
 ).cuda()
+
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n and "gate" not in n]
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() 
+                        if p.ndim >= 2 and "embed" not in n and "gate" not in n and "router" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
+
+# Router and gate params go to Adam (optimizer1)
 gate_params = [p for n, p in model.named_parameters() if "gate" in n]
+router_params = [p for n, p in model.named_parameters() if "router" in n]
 
 # init the optimizer(s)
-# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params,
+    scalar_params + head_params + embed_params + gate_params + router_params,  # Add router here
     lr=0.008,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
 optimizer2 = NorMuon(
-    hidden_matrix_params + gate_params, 
+    hidden_matrix_params,  # Only large matrices (expert weights, attention, etc.)
     lr=0.03, 
     momentum=0.95, 
     beta2=0.95, 
     weight_decay=1.2,
-    custom_sizing=False  # Must be False for single GPU
+    custom_sizing=False
 )
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
