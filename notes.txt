@@ -24,8 +24,8 @@ Now:
     - Same setting as above;
         - Results:
             - step:12000/12000 val_loss:10.8370 train_time:3760382ms step_avg:313.37ms
-            - peak memory allocated: 8383 MiB reserved: 10648 MiB
-            - Validation loss is increasing, need to resolve this bug.
+            - step:12000/12000 val_loss:4.4186 train_time:3760316ms step_avg:313.36ms
+            - peak memory allocated: 8383 MiB reserved: 10448 MiB
 - What are variations of MOE kernels available and their internal workings
 - Custom MoE kernels
 
