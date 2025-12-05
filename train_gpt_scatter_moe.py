@@ -1163,8 +1163,13 @@ model: nn.Module = GPT(
     num_experts=args.moe_num_experts  # Use from hyperparameters
 ).cuda()
 
+# CRITICAL FIX: Convert model to bfloat16 BEFORE accessing ScatterMoE experts
+# This ensures expert weights are initialized in bf16
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
+        m.bfloat16()
+    elif isinstance(m, ScatterMLP):
+        # ScatterMoE experts need explicit bf16 conversion
         m.bfloat16()
 
 # collect the parameters to optimize
