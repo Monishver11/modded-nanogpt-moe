@@ -638,15 +638,15 @@ class MoEMLP(nn.Module):
         self.experts = ScatterMLP(
             input_size=dim,
             hidden_size=self.hidden_dim,
-            activation=nn.ReLU(),
             num_experts=num_experts,
             top_k=top_k,
         )
         
         # Label expert weights for the optimizer
-        # IMPORTANT: ScatterMoE weights are 3D. They MUST go to AdamW, not Muon (which expects 2D)
-        self.experts.w1.label = 'moe_expert' 
-        self.experts.w2.label = 'moe_expert'
+        # ScatterMoE exposes experts as a parameter list, not individual w1/w2
+        # We need to iterate through the parameters and label them
+        for name, param in self.experts.named_parameters():
+            param.label = 'moe_expert'
 
     def forward(self, x: Tensor):
         """
@@ -1168,7 +1168,7 @@ for m in model.modules():
         m.bfloat16()
 
 # collect the parameters to optimize
-# IMPORTANT: Filter out MoE experts from Muon because they are 3D tensors (ScatterMoE)
+# IMPORTANT: Filter out MoE experts from Muon because they might be 3D tensors (depending on ScatterMoE internals)
 # Muon typically handles 2D matrices.
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() 
                         if p.ndim >= 2 and "embed" not in n and "gate" not in n and "router" not in n and "expert" not in n]
@@ -1258,12 +1258,9 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
 
-# Option 1: Keep compilation but be aware of shape constraints
-# model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
-
-# Option 2: Use dynamic shapes for more flexibility (slightly slower)
-# ScatterMoE usually works better with dynamic=False if shapes are constant, but we need graph breaks for kernels sometimes
-model: nn.Module = torch.compile(model, dynamic=True, fullgraph=True)
+# Compile with dynamic=True for ScatterMoE compatibility
+# ScatterMoE kernels may have data-dependent shapes
+model: nn.Module = torch.compile(model, dynamic=True, fullgraph=False)
 
 ########################################
 #            Warmup kernels            #
