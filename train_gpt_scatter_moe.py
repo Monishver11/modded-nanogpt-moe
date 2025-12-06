@@ -669,6 +669,11 @@ class MoEMLP(nn.Module):
         router_logits = self.router(x_flat) / self.router_logit_scale  # Scale down
         router_logits = torch.clamp(router_logits, -10, 10)  # Clip extreme values
         
+        # ADD THIS: Noise for exploration during training
+        if self.training:
+            noise = torch.randn_like(router_logits) * 0.1
+            router_logits = router_logits + noise
+
         # Calculate routing weights and indices
         router_probs = F.softmax(router_logits, dim=-1)
         
@@ -739,8 +744,8 @@ class Block(nn.Module):
         
         if layer_idx != 0:
             if use_moe:
-                # Use ScatterMoE with top-2 routing
-                self.mlp = MoEMLP(dim, num_experts=num_experts, top_k=2)
+                # Use ScatterMoE with top-1 routing
+                self.mlp = MoEMLP(dim, num_experts=num_experts, top_k=1)
             else:
                 self.mlp = MLP(dim)
         else:
@@ -1201,13 +1206,11 @@ router_params = [p for n, p in model.named_parameters() if "router" in n]
 expert_params = [p for n, p in model.named_parameters() if "expert" in n]
 
 # init the optimizer(s)
-optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params + gate_params + router_params + expert_params,  # experts added here
-    lr=0.008,
-    betas=(0.65, 0.95),
-    eps=1e-8,
-    weight_decay=0.0,
-)
+optimizer1 = DistAdam([
+    {'params': scalar_params + head_params + embed_params + gate_params + expert_params, 'lr': 0.008},
+    {'params': router_params, 'lr': 0.002},  # 4× lower LR for routers
+], betas=(0.65, 0.95), eps=1e-8, weight_decay=0.0)
+
 optimizer2 = NorMuon(
     hidden_matrix_params,  # Only large matrices (Attention, standard MLP)
     lr=0.03, 

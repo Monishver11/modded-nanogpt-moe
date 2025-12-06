@@ -38,7 +38,7 @@ Now:
             - Most Likely Cause: Expert Collapse + Numerical Instability
             - Fixes: Increase Aux Loss Weight + Add Router Gradient Clipping
             - There was graph breaks with torch.compile, so specifically disabled the MOEMLP forward for proper usage of triton kernels for the scatter-moe and all other operations with torch.compile.
-            
+            - Still the loss is diverging. Additional fixes to Scatter-MOE: Change to Top-1 Routing + Add Router Noise + Reduce Router Learning Rate 
 - Custom MoE kernels
 
 Impeding problems to solve:
@@ -51,6 +51,7 @@ References (Read):
 
 - https://medium.com/analytics-vidhya/sparse-matrix-vector-multiplication-with-cuda-42d191878e8f
 
+- https://www.youtube.com/watch?v=JndztlScZLA
 
 
 

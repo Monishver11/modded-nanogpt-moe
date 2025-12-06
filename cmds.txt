@@ -37,3 +37,6 @@ cd scattermoe
 pip install -e .
 
 TORCH_LOGS="graph_breaks" python train_gpt_scatter_moe.py
+
+git pull --rebase origin scatter-moe-package
+git push
