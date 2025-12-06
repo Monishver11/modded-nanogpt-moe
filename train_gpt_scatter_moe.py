@@ -629,6 +629,7 @@ class MoEMLP(nn.Module):
         # 1. Router: Maps input -> Expert Logits
         self.router = nn.Linear(dim, num_experts, bias=False)
         self.router.weight.label = 'moe_router' # Use AdamW for router
+        self.router_logit_scale = 1.0  # Add scaling
         
         # Init router with small weights to ensure random initial routing
         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
@@ -661,7 +662,9 @@ class MoEMLP(nn.Module):
         x_flat = x.view(-1, D) # ScatterMoE expects flattened tokens [N, D]
 
         # --- 1. Routing ---
-        router_logits = self.router(x_flat) # [N, NumExperts]
+        # router_logits = self.router(x_flat) # [N, NumExperts]
+        router_logits = self.router(x_flat) / self.router_logit_scale  # Scale down
+        router_logits = torch.clamp(router_logits, -10, 10)  # Clip extreme values
         
         # Calculate routing weights and indices
         router_probs = F.softmax(router_logits, dim=-1)
@@ -1109,7 +1112,7 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20
 
     # MoE-specific hyperparameters
-    moe_aux_loss_weight: float = 0.001  # Weight for auxiliary loss
+    moe_aux_loss_weight: float = 0.01  # Weight for auxiliary loss
     moe_num_experts: int = 4           # Number of experts
     moe_expert_capacity_factor: float = 1.25  # Capacity factor for token dropping
 

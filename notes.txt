@@ -33,6 +33,10 @@ Now:
             - The step_avg is around 350ms, which is greater than Baseline MOE V1/V2. This could be becuase, would need around 8k-16k tokens to amortize the overhead of (sorting tokens by expert assignment, computing histograms and launching multiple kernel passes (gather -> compute -> scatter)).
             - Also, the Baseline MOE's makes use of torch.compile, which efficiently fuses some operations leading to better performance.
         - Results of increased batch size (8k):
+            - step:12000/12000 val_loss:9.1542 train_time:4506529ms step_avg:375.54ms
+            - peak memory allocated: 10508 MiB reserved: 10656 MiB
+            - Most Likely Cause: Expert Collapse + Numerical Instability
+            - Fixes: Increase Aux Loss Weight + Add Router Gradient Clipping
             - 
 - Custom MoE kernels
 
