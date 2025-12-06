@@ -37,7 +37,8 @@ Now:
             - peak memory allocated: 10508 MiB reserved: 10656 MiB
             - Most Likely Cause: Expert Collapse + Numerical Instability
             - Fixes: Increase Aux Loss Weight + Add Router Gradient Clipping
-            - 
+            - There was graph breaks with torch.compile, so specifically disabled the MOEMLP forward for proper usage of triton kernels for the scatter-moe and all other operations with torch.compile.
+            
 - Custom MoE kernels
 
 Impeding problems to solve:
