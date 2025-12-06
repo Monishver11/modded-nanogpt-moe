@@ -634,17 +634,21 @@ class MoEMLP(nn.Module):
         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
 
         # 2. Experts: The Fused ScatterMoE Kernel
-        # This handles the "Gather -> MLP -> Scatter" efficiently without padding
+        # ScatterMoE uses ReLU^2 by default, but we need to match the MLP activation
+        # Create a custom activation that does ReLU^2
+        class ReluSquared(nn.Module):
+            def forward(self, x):
+                return F.relu(x).square()
+        
         self.experts = ScatterMLP(
             input_size=dim,
             hidden_size=self.hidden_dim,
             num_experts=num_experts,
             top_k=top_k,
+            activation=ReluSquared(),  # Pass an instance of the activation
         )
         
         # Label expert weights for the optimizer
-        # ScatterMoE exposes experts as a parameter list, not individual w1/w2
-        # We need to iterate through the parameters and label them
         for name, param in self.experts.named_parameters():
             param.label = 'moe_expert'
 
