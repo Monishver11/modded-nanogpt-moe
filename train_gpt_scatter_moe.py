@@ -1087,9 +1087,9 @@ class Hyperparameters:
     val_tokens: int = 524288  # Reduced from 10485760 (20x smaller)
     
     # CRITICAL: Reduce batch sizes for 12GB VRAM
-    train_batch_size: int = 4096   # was 2048
+    train_batch_size: int = 8192   # was 2048
     train_max_seq_len: int = 1024  # Reduced from 2048
-    val_batch_size: int = 4096     # match train batch
+    val_batch_size: int = 8192     # match train batch
     
     # optimization
     num_scheduled_iterations: int = 11500

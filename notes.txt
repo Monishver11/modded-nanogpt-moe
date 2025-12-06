@@ -27,6 +27,13 @@ Now:
             - step:12000/12000 val_loss:4.4186 train_time:3760316ms step_avg:313.36ms
             - peak memory allocated: 8383 MiB reserved: 10448 MiB
 - What are variations of MOE kernels available and their internal workings
+    - Scatter-MOE;
+        - Results:
+            - 
+            - The step_avg is around 350ms, which is greater than Baseline MOE V1/V2. This could be becuase, would need around 8k-16k tokens to amortize the overhead of (sorting tokens by expert assignment, computing histograms and launching multiple kernel passes (gather -> compute -> scatter)).
+            - Also, the Baseline MOE's makes use of torch.compile, which efficiently fuses some operations leading to better performance.
+        - Results of increased batch size (16k):
+            - 
 - Custom MoE kernels
 
 Impeding problems to solve:

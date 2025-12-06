@@ -27,3 +27,5 @@ python data/cached_fineweb10B.py 9
 
 python train_gpt.py
 
+watch -n 1 nvidia-smi
+nvitop
