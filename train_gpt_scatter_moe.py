@@ -29,6 +29,8 @@ import triton.language as tl
 from kernels import get_kernel
 from torch import Tensor, nn
 
+from torch.compiler import disable
+
 # --- SCATTERMOE IMPORT ---
 try:
     from scattermoe.mlp import MLP as ScatterMLP
@@ -653,6 +655,7 @@ class MoEMLP(nn.Module):
         for name, param in self.experts.named_parameters():
             param.label = 'moe_expert'
 
+    @disable
     def forward(self, x: Tensor):
         """
         Inputs: x [Batch, SeqLen, Dim]
@@ -818,7 +821,10 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        # Manual unrolling helps torch.compile see the structure
+        ve = []
+        for i in range(len(self.value_embeds)):
+            ve.append(self.value_embeds[i](input_seq))
         ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
