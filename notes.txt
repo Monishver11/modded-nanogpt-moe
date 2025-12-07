@@ -23,11 +23,32 @@ Now:
 - Baseline MOE V2 - With Auxiliary Loss for Expert Load Balancing 
     - Same setting as above;
         - Results:
-            - step:12000/12000 val_loss:10.8370 train_time:3760382ms step_avg:313.37ms
             - step:12000/12000 val_loss:4.4186 train_time:3760316ms step_avg:313.36ms
             - peak memory allocated: 8383 MiB reserved: 10448 MiB
 - What are variations of MOE kernels available and their internal workings
-- Custom MoE kernels
+    - Scatter-MOE;
+        - Results:
+            - step:12000/12000 val_loss:4.7143 train_time:4175230ms step_avg:347.94ms
+            - peak memory allocated: 6948 MiB reserved: 7010 MiB
+            - The step_avg is around 350ms, which is greater than Baseline MOE V1/V2. This could be becuase, would need around 8k-16k tokens to amortize the overhead of (sorting tokens by expert assignment, computing histograms and launching multiple kernel passes (gather -> compute -> scatter)).
+            - Also, the Baseline MOE's makes use of torch.compile, which efficiently fuses some operations leading to better performance.
+        - Results of increased batch size (8k):
+            - step:12000/12000 val_loss:9.1542 train_time:4506529ms step_avg:375.54ms
+            - peak memory allocated: 10508 MiB reserved: 10656 MiB
+            - Most Likely Cause: Expert Collapse + Numerical Instability
+            - Fixes: Increase Aux Loss Weight + Add Router Gradient Clipping
+            - There was graph breaks with torch.compile, so specifically disabled the MOEMLP forward for proper usage of triton kernels for the scatter-moe and all other operations with torch.compile.
+            - Still the loss is diverging. Additional fixes to Scatter-MOE: Change to Top-1 Routing + Add Router Noise + Reduce Router Learning Rate 
+            - step:12000/12000 val_loss:4.5837 train_time:4081191ms step_avg:340.10ms
+            - peak memory allocated: 9319 MiB reserved: 9496 MiB
+            - The training is bit stable, but for verification we need increase the # steps and see. If there are fluctuations, then we need to tweak params.
+    - MegaBlocks
+        - Batch_size = 4096 and working with torch.compile
+        - step:12000/12000 val_loss:5.0546 train_time:2655375ms step_avg:221.28ms
+        - peak memory allocated: 10693 MiB reserved: 10850 MiB
+        - Loss is decreasing slowly, tweak the hyperparameters next.
+- Custom MoE kernels (Current)
+    - Brainstrom ideas from all above, and in comparison with SOTA architecture and models. Define the flow of computation and narrow down the bottlenecks and optimize them.
 
 Impeding problems to solve:
 - Find a routing mechanism that simultaneously improves both expert utilization and specialization (Chi et al., 2022; Qiu et al., 2025). This matters because we want to improve performance by adding hundreds or even thousands of experts, but router inefficiency seems to become more troublesome with more experts. As the core component of the MoE system, if the router collapses, the MoE scaling advantages can vanish entirely.
@@ -36,6 +57,10 @@ References (Read):
 - https://www.cerebras.ai/blog/moe-guide-why-moe
 - https://www.cerebras.ai/blog/moe-guide-router
 - https://www.cerebras.ai/blog/moe-guide-debug - (Load balancing MOE in modded-nanogpt)
+
+- https://medium.com/analytics-vidhya/sparse-matrix-vector-multiplication-with-cuda-42d191878e8f
+
+- https://www.youtube.com/watch?v=JndztlScZLA
 
 
 

@@ -1,0 +1,7 @@
+# Ignore the data and papers directory
+data/
+papers/
+
+# Ignore Mac system files
+.DS_Store
+**/.DS_Store

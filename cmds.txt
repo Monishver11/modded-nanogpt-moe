@@ -27,3 +27,47 @@ python data/cached_fineweb10B.py 9
 
 python train_gpt.py
 
+watch -n 1 nvidia-smi
+nvitop
+
+# Clone and install ScatterMoE (it needs to compile the Triton kernels)
+
+git clone https://github.com/shawntan/scattermoe
+cd scattermoe
+pip install -e .
+
+TORCH_LOGS="graph_breaks" python train_gpt_scatter_moe.py
+
+# Install MegaBlocks
+cd ..
+git clone https://github.com/stanford-futuredata/megablocks.git
+cd megablocks
+pip install -e .
+
+# 1. Uninstall broken packages
+pip uninstall -y stanford-stk megablocks
+
+# 2. Re-install stanford-stk forcing usage of scratch for compilation
+# (This compiles the CUDA kernels, which takes time and space)
+TMPDIR=/scratch/mc10322/tmp pip install stanford-stk --no-cache-dir --force-reinstall
+
+# 3. Re-install megablocks
+pip install megablocks
+
+# Verify
+python -c "import stk; print('STK Version:', stk.__version__)"
+python -c "import megablocks.ops; print(True)"
+
+pip install git+https://github.com/tgale96/grouped_gemm@main
+python -c "import grouped_gemm; print('Grouped GEMM installed successfully!')"
+
+
+# Clear pip cache (often gigabytes)
+rm -rf ~/.cache/pip
+# Clear conda cache (if using conda)
+conda clean --all -y
+quota -s
+
+# git cmds;
+git pull --rebase origin scatter-moe-package
+git push
