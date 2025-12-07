@@ -44,6 +44,19 @@ git clone https://github.com/stanford-futuredata/megablocks.git
 cd megablocks
 pip install -e .
 
+# 1. Uninstall broken packages
+pip uninstall -y stanford-stk megablocks
+
+# 2. Re-install stanford-stk forcing usage of scratch for compilation
+# (This compiles the CUDA kernels, which takes time and space)
+TMPDIR=/scratch/mc10322/tmp pip install stanford-stk --no-cache-dir --force-reinstall
+
+# 3. Re-install megablocks
+pip install megablocks
+
+# Verify
+python -c "import stk; print('STK Version:', stk.__version__)"
+python -c "import megablocks.ops; print(True)"
 
 # Clear pip cache (often gigabytes)
 rm -rf ~/.cache/pip

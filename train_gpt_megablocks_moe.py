@@ -619,6 +619,7 @@ class CausalSelfAttention(nn.Module):
 class MegaBlocksMoEMLP(nn.Module):
     """
     MoE MLP using MegaBlocks library for optimized sparse computation.
+    Uses GLU activation (required for Triton >= 3.2.0)
     """
     def __init__(self, dim: int, num_experts: int = 4, top_k: int = 1):
         super().__init__()
@@ -627,14 +628,16 @@ class MegaBlocksMoEMLP(nn.Module):
         self.top_k = top_k
         self.hidden_dim = 4 * dim
         
-        # Create MegaBlocks MoE arguments
+        # Create MegaBlocks MoE arguments compatible with Triton 3.x
         self.moe_args = MoEArguments(
             hidden_size=dim,
             ffn_hidden_size=self.hidden_dim,
             moe_num_experts=num_experts,
             moe_top_k=top_k,
             moe_capacity_factor=1.25,
-            moe_normalize_expert_weights=1,  # Normalize router weights
+            moe_normalize_expert_weights=1,
+            mlp_impl="grouped",  # Required for Triton >= 3.2.0
+            mlp_type="glu",      # GLU activation (not ReLU²)
             bf16=True,
             device=torch.cuda.current_device(),
         )
@@ -644,7 +647,7 @@ class MegaBlocksMoEMLP(nn.Module):
         
         # Label parameters for optimizer
         for name, param in self.moe.named_parameters():
-            if 'router' in name:
+            if 'router' in name or 'gate' in name:
                 param.label = 'moe_router'
             else:
                 param.label = 'moe_expert'
@@ -669,7 +672,7 @@ class MegaBlocksMoEMLP(nn.Module):
         # Create auxiliary loss dict
         aux_loss_dict = {
             'load_balancing_loss': aux_loss if aux_loss is not None else torch.tensor(0.0, device=x.device),
-            'router_z_loss': torch.tensor(0.0, device=x.device),  # MegaBlocks doesn't compute z-loss
+            'router_z_loss': torch.tensor(0.0, device=x.device),
         }
         
         return output, aux_loss_dict
