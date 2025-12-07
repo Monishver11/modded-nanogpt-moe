@@ -649,6 +649,7 @@ class MoEMLP(nn.Module):
             num_experts=num_experts,
             top_k=top_k,
             activation=ReluSquared(),  # Pass an instance of the activation
+            bias=True  # <--- ADD THIS LINE (Force bias to exist)
         )
         
         # Label expert weights for the optimizer
