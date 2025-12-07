@@ -42,7 +42,9 @@ Now:
             - step:12000/12000 val_loss:4.5837 train_time:4081191ms step_avg:340.10ms
             - peak memory allocated: 9319 MiB reserved: 9496 MiB
             - The training is bit stable, but for verification we need increase the # steps and see. If there are fluctuations, then we need to tweak params.
-    - 
+    - MegaBlocks
+        - Batch_size = 4096
+        - 
 - Custom MoE kernels
 
 Impeding problems to solve:
