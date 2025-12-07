@@ -1107,7 +1107,12 @@ print0("="*100)
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
 print0(f"Running Triton version {triton.__version__}")
-print0(f"Running MegaBlocks version {megablocks.__version__}")
+import importlib.metadata
+try:
+    version = importlib.metadata.version("megablocks")
+except:
+    version = "unknown"
+print0(f"Running MegaBlocks version {version}")
 
 def nvidia_smi():
     import subprocess

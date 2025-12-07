@@ -45,6 +45,11 @@ cd megablocks
 pip install -e .
 
 
+# Clear pip cache (often gigabytes)
+rm -rf ~/.cache/pip
+# Clear conda cache (if using conda)
+conda clean --all -y
+quota -s
 
 # git cmds;
 git pull --rebase origin scatter-moe-package
