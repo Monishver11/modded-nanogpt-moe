@@ -1163,7 +1163,7 @@ for m in model.modules():
 for m in model.modules():
     if isinstance(m, MegaBlocksMoEMLP):
         m.moe.half()
-        print0(f"Converted MegaBlocks MoE to FP16", console=True)
+        # print0(f"Converted MegaBlocks MoE to FP16", console=True)
 
 # Collect parameters for optimizers
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() 
