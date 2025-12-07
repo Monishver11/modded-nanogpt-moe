@@ -1356,7 +1356,10 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 train_steps = args.num_iterations
+
+# MOVE THIS BEFORE THE LOOP
 ws_short, ws_long = get_ws(0)
+
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     ws_short, new_ws_long = get_ws(step)
