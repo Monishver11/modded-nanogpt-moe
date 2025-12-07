@@ -47,7 +47,8 @@ Now:
         - step:12000/12000 val_loss:5.0546 train_time:2655375ms step_avg:221.28ms
         - peak memory allocated: 10693 MiB reserved: 10850 MiB
         - Loss is decreasing slowly, tweak the hyperparameters next.
-- Custom MoE kernels
+- Custom MoE kernels (Current)
+    - Brainstrom ideas from all above, and in comparison with SOTA architecture and models. Define the flow of computation and narrow down the bottlenecks and optimize them.
 
 Impeding problems to solve:
 - Find a routing mechanism that simultaneously improves both expert utilization and specialization (Chi et al., 2022; Qiu et al., 2025). This matters because we want to improve performance by adding hundreds or even thousands of experts, but router inefficiency seems to become more troublesome with more experts. As the core component of the MoE system, if the router collapses, the MoE scaling advantages can vanish entirely.
