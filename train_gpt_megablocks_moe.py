@@ -1165,33 +1165,59 @@ for m in model.modules():
         m.moe.half()
         # print0(f"Converted MegaBlocks MoE to FP16", console=True)
 
-# Collect parameters for optimizers (around line 1161)
-# Get all MoE-related params first
-router_params = [p for n, p in model.named_parameters() if "router" in n or "gate" in n.lower() and "moe" in n.lower()]
-expert_params = [p for n, p in model.named_parameters() if "expert" in n or ("moe" in n.lower() and "mlp" in n.lower())]
+# Collect parameters for optimizers - MUTUALLY EXCLUSIVE GROUPS
+# Step 1: Identify all MoE parameters first
+router_param_ids = {id(p) for n, p in model.named_parameters() if "router" in n}
+expert_param_ids = {id(p) for n, p in model.named_parameters() if "expert" in n}
+moe_param_ids = router_param_ids | expert_param_ids
 
-# Get MoE param IDs to exclude them from other groups
-moe_param_ids = {id(p) for p in router_params + expert_params}
+# Step 2: Collect MoE parameters
+router_params = [p for n, p in model.named_parameters() if "router" in n]
+expert_params = [p for n, p in model.named_parameters() if "expert" in n]
 
-# Collect other params, excluding MoE params
+# Step 3: Collect non-MoE parameters (excluding anything in MoE)
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() 
-                        if p.ndim >= 2 and id(p) not in moe_param_ids 
-                        and "embed" not in n and "gate" not in n]
+                        if p.ndim >= 2 
+                        and id(p) not in moe_param_ids
+                        and "embed" not in n 
+                        and "gate" not in n]
 
-embed_params = [p for n, p in model.named_parameters() if "embed" in n and id(p) not in moe_param_ids]
-scalar_params = [p for p in model.parameters() if p.ndim < 2 and id(p) not in moe_param_ids]
+embed_params = [p for n, p in model.named_parameters() 
+                if "embed" in n and id(p) not in moe_param_ids]
+
+scalar_params = [p for p in model.parameters() 
+                 if p.ndim < 2 and id(p) not in moe_param_ids]
+
 head_params = [model.lm_head.weight] if id(model.lm_head.weight) not in moe_param_ids else []
 
-gate_params = [p for n, p in model.named_parameters() if "gate" in n and id(p) not in moe_param_ids]
+gate_params = [p for n, p in model.named_parameters() 
+               if "gate" in n and id(p) not in moe_param_ids]
+
+# Debug: Print param counts
+print0(f"Parameter groups:", console=True)
+print0(f"  Router params: {len(router_params)}", console=True)
+print0(f"  Expert params: {len(expert_params)}", console=True)
+print0(f"  Hidden matrix params: {len(hidden_matrix_params)}", console=True)
+print0(f"  Embed params: {len(embed_params)}", console=True)
+print0(f"  Scalar params: {len(scalar_params)}", console=True)
+print0(f"  Head params: {len(head_params)}", console=True)
+print0(f"  Gate params: {len(gate_params)}", console=True)
 
 # init the optimizer(s)
-# Quick fix - just lower LRs by half
 optimizer1 = DistAdam([
     {'params': scalar_params + head_params + embed_params + gate_params + expert_params, 'lr': 0.004},
     {'params': router_params, 'lr': 0.001},
 ], betas=(0.65, 0.95), eps=1e-8, weight_decay=0.0)
 
-optimizer2 = NorMuon(hidden_matrix_params, lr=0.015, momentum=0.95, beta2=0.95, weight_decay=1.2, custom_sizing=False)
+optimizer2 = NorMuon(
+    hidden_matrix_params,
+    lr=0.015, 
+    momentum=0.95, 
+    beta2=0.95, 
+    weight_decay=1.2,
+    custom_sizing=False
+)
+
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
