@@ -882,9 +882,9 @@ class GPT(nn.Module):
             total_loss = ce_loss
         
         # DEBUG
-        print(f"ce_loss shape: {ce_loss.shape}, value: {ce_loss.item() if ce_loss.numel() == 1 else 'NOT SCALAR'}")
-        print(f"total_loss shape: {total_loss.shape}, value: {total_loss.item() if total_loss.numel() == 1 else 'NOT SCALAR'}")
-        print(f"total_loss has {total_loss.numel()} elements")
+        # print(f"ce_loss shape: {ce_loss.shape}, value: {ce_loss.item() if ce_loss.numel() == 1 else 'NOT SCALAR'}")
+        # print(f"total_loss shape: {total_loss.shape}, value: {total_loss.item() if total_loss.numel() == 1 else 'NOT SCALAR'}")
+        # print(f"total_loss has {total_loss.numel()} elements")
         
         return total_loss
 
@@ -1267,7 +1267,7 @@ for step in range(warmup_steps):
             ws_long = new_ws_long
     
     loss = model(inputs, targets, cum_seqlens, ws_long//2, ws_long)
-    print0(f"Warmup step {step}, loss: {loss.item()}", console=True)  # Debug print
+    # print0(f"Warmup step {step}, loss: {loss.item()}", console=True)  # Debug print
     loss.backward()
     
     for opt in optimizers:
