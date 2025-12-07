@@ -1239,8 +1239,7 @@ def step_optimizers(step: int, optimizers, model):
 ########################################
 
 warmup_steps = 30
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers])
+# Don't save/restore state for MegaBlocks - just reset optimizers
 train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
 for step in range(warmup_steps):
     inputs, targets, cum_seqlens = next(train_loader)
@@ -1253,15 +1252,29 @@ for step in range(warmup_steps):
         if new_ws_long != ws_long:
             model.yarn.apply(ws_long, new_ws_long)
             ws_long = new_ws_long
-    model(inputs, targets, cum_seqlens, ws_long//2, ws_long).backward()
+    
+    loss = model(inputs, targets, cum_seqlens, ws_long//2, ws_long)
+    print0(f"Warmup step {step}, loss: {loss.item()}", console=True)  # Debug print
+    loss.backward()
+    
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+
+# Reset everything
 model.yarn.reset()
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del train_loader, initial_state
+for opt in optimizers:
+    opt.zero_grad(set_to_none=True)
+    for group in opt.param_groups:
+        for p in group['params']:
+            if 'momentum_buffer' in opt.state[p]:
+                opt.state[p]['momentum_buffer'].zero_()
+            if 'exp_avg' in opt.state[p]:
+                opt.state[p]['exp_avg'].zero_()
+            if 'exp_avg_sq' in opt.state[p]:
+                opt.state[p]['exp_avg_sq'].zero_()
+
+del train_loader
 
 ########################################
 #        Training and validation       #
