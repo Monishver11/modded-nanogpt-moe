@@ -674,6 +674,10 @@ class MegaBlocksMoEMLP(nn.Module):
         # Transpose back [T, B, D] -> [B, T, D] and convert FP16 -> BF16
         output = output.transpose(0, 1).to(torch.bfloat16)
         
+        # CRITICAL FIX: Ensure aux_loss is scalar
+        if aux_loss is not None and aux_loss.numel() > 1:
+            aux_loss = aux_loss.mean()  # Reduce to scalar
+        
         # Create auxiliary loss dict
         aux_loss_dict = {
             'load_balancing_loss': aux_loss if aux_loss is not None else torch.tensor(0.0, device=x.device),
@@ -842,11 +846,8 @@ class GPT(nn.Module):
             # Accumulate MoE auxiliary losses
             if aux_loss_dict is not None:
                 moe_layer_count += 1
+                # No need for .mean() check here since it's already fixed in MegaBlocksMoEMLP
                 total_aux_loss += aux_loss_dict['load_balancing_loss']
-                aux_loss_scalar = aux_loss_dict['load_balancing_loss']
-                # MegaBlocks doesn't have router_z_loss, so skip it
-                print(f"Layer {i} aux_loss shape: {aux_loss_scalar.shape}")  # DEBUG
-                total_aux_loss += aux_loss_scalar
             
             if i < n:
                 skip_connections.append(x)
