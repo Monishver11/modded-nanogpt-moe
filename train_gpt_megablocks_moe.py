@@ -619,7 +619,7 @@ class CausalSelfAttention(nn.Module):
 class MegaBlocksMoEMLP(nn.Module):
     """
     MoE MLP using MegaBlocks library for optimized sparse computation.
-    Uses GLU activation (required for Triton >= 3.2.0)
+    Uses GLU activation and FP16 (MegaBlocks doesn't support BF16 properly)
     """
     def __init__(self, dim: int, num_experts: int = 4, top_k: int = 1):
         super().__init__()
@@ -628,7 +628,7 @@ class MegaBlocksMoEMLP(nn.Module):
         self.top_k = top_k
         self.hidden_dim = 4 * dim
         
-        # Create MegaBlocks MoE arguments compatible with Triton 3.x
+        # Create MegaBlocks MoE arguments
         self.moe_args = MoEArguments(
             hidden_size=dim,
             ffn_hidden_size=self.hidden_dim,
@@ -636,15 +636,18 @@ class MegaBlocksMoEMLP(nn.Module):
             moe_top_k=top_k,
             moe_capacity_factor=1.25,
             moe_normalize_expert_weights=1,
-            mlp_impl="grouped",  # Required for Triton >= 3.2.0
-            mlp_type="glu",      # GLU activation (not ReLU²)
-            bf16=False,  # CHANGE FROM True TO False (use FP16 instead)
-            fp16=True,   
+            mlp_impl="grouped",
+            mlp_type="glu",
+            bf16=False,
+            fp16=True,
             device=torch.cuda.current_device(),
         )
         
         # MegaBlocks MoE layer
         self.moe = moe.MoE(self.moe_args)
+        
+        # Convert all MoE weights to FP16 (critical!)
+        self.moe.half()
         
         # Label parameters for optimizer
         for name, param in self.moe.named_parameters():
@@ -656,11 +659,11 @@ class MegaBlocksMoEMLP(nn.Module):
     def forward(self, x: Tensor):
         """
         Input: x [Batch, SeqLen, Dim] in BFloat16
-        Returns: output, aux_loss_dict
+        Returns: output, aux_loss_dict in BFloat16
         """
         B, T, D = x.shape
         
-        # Convert BF16 -> FP16 for MegaBlocks
+        # Convert BF16 -> FP16 for MegaBlocks compatibility
         x_fp16 = x.to(torch.float16)
         
         # MegaBlocks expects [SeqLen, Batch, Dim] format
@@ -669,7 +672,7 @@ class MegaBlocksMoEMLP(nn.Module):
         # Forward through MegaBlocks MoE
         output, aux_loss = self.moe(x_transposed)
         
-        # Transpose back and convert FP16 -> BF16
+        # Transpose back [T, B, D] -> [B, T, D] and convert FP16 -> BF16
         output = output.transpose(0, 1).to(torch.bfloat16)
         
         # Create auxiliary loss dict
@@ -1137,8 +1140,11 @@ model: nn.Module = GPT(
     num_experts=args.moe_num_experts
 ).cuda()
 
-# Convert to bfloat16
+# Convert to bfloat16 (but skip MegaBlocks MoE which uses FP16)
 for m in model.modules():
+    # Skip MegaBlocks modules
+    if isinstance(m, MegaBlocksMoEMLP):
+        continue
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
 
