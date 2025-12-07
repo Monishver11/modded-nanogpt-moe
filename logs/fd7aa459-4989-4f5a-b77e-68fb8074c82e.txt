@@ -1,0 +1,1687 @@
+import os
+import sys
+
+with open(sys.argv[0]) as f:
+    code = f.read()  # read the code of this file ASAP, for logging
+import copy
+import glob
+import math
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from itertools import accumulate
+from pathlib import Path
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import torch
+
+torch.empty(
+    1, device="cuda", requires_grad=True
+).backward()  # prevents a bug on some systems
+import torch._dynamo as dynamo
+import torch.distributed as dist
+import torch.nn.functional as F
+
+import triton
+import triton.language as tl
+from kernels import get_kernel
+from torch import Tensor, nn
+
+# --- MEGABLOCKS IMPORT ---
+try:
+    import megablocks
+    import megablocks.layers.moe as moe
+    from megablocks.layers.arguments import Arguments as MoEArguments
+except ImportError:
+    print("Error: megablocks not found. Please install via: pip install megablocks")
+    sys.exit(1)
+
+dynamo.config.recompile_limit = 64
+
+# -----------------------------------------------------------------------------
+# Triton kernel for symmetric matrix multiplication by @byronxu99
+
+def _get_autotune_configs():
+    return [
+        triton.Config(
+            {
+                "BLOCK_SIZE_M": bm,
+                "BLOCK_SIZE_N": bn,
+                "BLOCK_SIZE_K": bk,
+                "GROUP_SIZE_M": 8,
+                "LOWER_UPPER": 1,
+            },
+            num_stages=stages,
+            num_warps=warps,
+        )
+        for bm in [64, 128]
+        for bn in [64, 128, 256]
+        for bk in [64, 128]
+        for stages, warps in [(3, 4), (3, 8), (4, 4)]
+        if bm // bn <= 2 and bn // bm <= 2
+    ]
+
+@triton.jit
+def _pid_to_block(
+    pid,
+    M,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    # Split output matrix into blocks of size (BLOCK_SIZE_M, BLOCK_SIZE_N)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(M, BLOCK_SIZE_N)
+
+    # Map PID to a single matrix in batch
+    batch_idx = pid // (num_pid_m * num_pid_n)
+    pid = pid % (num_pid_m * num_pid_n)
+
+    # Map PID to 2D grid of blocks
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    pid_m, pid_n = tl.swizzle2d(pid_m, pid_n, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
+    m_idx = pid_m * BLOCK_SIZE_M
+    n_idx = pid_n * BLOCK_SIZE_N
+    return batch_idx, m_idx, n_idx
+
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+)
+@triton.jit
+def XXT_kernel(
+    A_ptr, C_ptr,
+    M, K,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def XXT(A: torch.Tensor, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = A @ A.T
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert out.size(-2) == M, "Output matrix has incorrect shape"
+    assert out.size(-1) == M, "Output matrix has incorrect shape"
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    grid = lambda meta: (
+        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+    )
+    XXT_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        K=K,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+    )
+    return out
+
+@triton.autotune(
+    configs=_get_autotune_configs(),
+    key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
+)
+@triton.jit
+def ba_plus_cAA_kernel(
+    A_ptr, C_ptr,
+    M,
+    a_stride_b, a_stride_r, a_stride_c,
+    c_stride_b, c_stride_r, c_stride_c,
+    alpha, beta,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    LOWER_UPPER: tl.constexpr,
+):
+    # This is mostly duplicated from XXT_kernel, but also loads and adds a block of A
+    # Performance is slightly slower than XXT_kernel, so we use two separate kernels
+    pid = tl.program_id(axis=0)
+    batch_idx, m_idx, n_idx = _pid_to_block(
+        pid, M, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M
+    )
+
+    # Skip blocks that don't need to be computed
+    skip_block_below_diag = (LOWER_UPPER == 0) and (n_idx + BLOCK_SIZE_N <= m_idx)
+    skip_block_above_diag = (LOWER_UPPER != 0) and (m_idx + BLOCK_SIZE_M <= n_idx)
+    if skip_block_below_diag or skip_block_above_diag:
+        return
+
+    # Index into one matrix of batch
+    A_ptr += batch_idx * a_stride_b
+    C_ptr += batch_idx * c_stride_b
+
+    # Create pointer arrays for A and A.T
+    offs_m = (m_idx + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (n_idx + tl.arange(0, BLOCK_SIZE_N)) % M
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A_ptr + (offs_m[:, None] * a_stride_r + offs_k[None, :] * a_stride_c)
+    at_ptrs = A_ptr + (offs_k[:, None] * a_stride_c + offs_n[None, :] * a_stride_r)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # Accumulate over blocks of K
+    for k in tl.range(0, tl.cdiv(M, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < M - k * BLOCK_SIZE_K, other=0.0)
+        at = tl.load(at_ptrs, mask=offs_k[:, None] < M - k * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, at, accumulator)
+        a_ptrs += BLOCK_SIZE_K * a_stride_c
+        at_ptrs += BLOCK_SIZE_K * a_stride_c
+
+    # Load block of A to add (corresponds to the current block of C)
+    offs_am = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_an = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    a_add_ptrs = A_ptr + (offs_am[:, None] * a_stride_r + offs_an[None, :] * a_stride_c)
+    a_add_mask = (offs_am[:, None] < M) & (offs_an[None, :] < M)
+    a_add = tl.load(a_add_ptrs, mask=a_add_mask, other=0.0).to(tl.float32)
+
+    # Apply alpha and beta
+    accumulator *= alpha
+    accumulator += a_add * beta
+
+    out_dtype = C_ptr.dtype.element_ty
+    output = accumulator.to(out_dtype)
+
+    # Store block of C
+    offs_cm = m_idx + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = n_idx + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C_ptr + (offs_cm[:, None] * c_stride_r + offs_cn[None, :] * c_stride_c)
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+    tl.store(c_ptrs, output, mask=c_mask)
+
+    # Store block of C mirrored across the diagonal
+    c_ptrs_t = C_ptr + (offs_cn[:, None] * c_stride_r + offs_cm[None, :] * c_stride_c)
+    c_mask_t = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+    tl.store(c_ptrs_t, output.T, mask=c_mask_t)
+
+def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
+    """
+    Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
+    """
+    assert A.ndim == 2 or A.ndim == 3
+    M, K = A.shape[-2:]
+    assert M == K, "Input matrix must be square"
+    assert out.size(-2) == M
+    assert out.size(-1) == M
+
+    batch_size = A.size(0) if A.ndim == 3 else 1
+    input_batch_stride = A.stride(0) if A.ndim == 3 else 0
+    output_batch_stride = out.stride(0) if out.ndim == 3 else 0
+
+    grid = lambda meta: (
+        batch_size * triton.cdiv(M, meta["BLOCK_SIZE_M"]) * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+    )
+    ba_plus_cAA_kernel[grid](
+        A_ptr=A,
+        C_ptr=out,
+        M=M,
+        a_stride_b=input_batch_stride,
+        a_stride_r=A.stride(-2),
+        a_stride_c=A.stride(-1),
+        c_stride_b=output_batch_stride,
+        c_stride_r=out.stride(-2),
+        c_stride_c=out.stride(-1),
+        alpha=alpha,
+        beta=beta,
+    )
+    return out
+
+# Computed for num_iters=5, safety_factor=2e-2, cushion=2
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
+@torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
+def polar_express(G: torch.Tensor):
+    """
+    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+    Code adapted from https://github.com/NoahAmsel/PolarExpress/tree/main by @varunneal.
+    """
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+
+    # Allocate buffers
+    X = X.contiguous()
+    A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+    B = torch.empty_like(A)
+    C = torch.empty_like(X)
+
+    aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+    # Perform the iterations
+    for a, b, c in polar_express_coeffs:
+        XXT(X, out=A)  # A = X @ X.mT
+        ba_plus_cAA(A, alpha=c, beta=b, out=B)  # B = b * A + c * A @ A
+        aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+        X, C = C, X  # Swap references to avoid unnecessary copies
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+# -----------------------------------------------------------------------------
+# NorMuon optimizer
+
+class NorMuon(torch.optim.Optimizer):
+    """
+    Single-GPU version of NorMuon optimizer.
+    Removes all distributed communication logic.
+    """
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=False):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+        self.world_size = 1  # Always 1 for single GPU
+        
+        # Always use standard param groups for single GPU
+        param_groups = self.generate_standard_param_groups(params)
+        super().__init__(param_groups, defaults)
+
+    def reset(self):
+        # expose a reset for clearing buffers
+        for group in self.param_groups:
+            if "momentum_buffer" in group:
+                group["momentum_buffer"].zero_()
+            if "second_momentum_buffer" in group:
+                group["second_momentum_buffer"].zero_()
+
+    def generate_standard_param_groups(self, params):
+        """Creates one param group per module type."""
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for param in params:
+            groups[param.label].append(param)
+
+        param_groups = []
+        for module_name, group_params in groups.items():
+            param_groups.append(dict(params=group_params))
+        
+        return param_groups
+
+    @torch.no_grad()
+    def step(self):
+        """Single-GPU step - no distributed communication."""
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            if not params:
+                continue
+
+            # Stack all gradients for this group
+            grad_list = [p.grad for p in params]
+            stacked_grads = torch.stack(grad_list)
+            
+            # Initialize momentum buffers if needed
+            if "momentum_buffer" not in group:
+                group["momentum_buffer"] = torch.zeros_like(stacked_grads)
+            momentum_buffer = group["momentum_buffer"]
+            
+            # Apply momentum update
+            momentum_buffer.lerp_(stacked_grads, 1 - group["momentum"])
+            updated_grads = stacked_grads.lerp_(momentum_buffer, group["momentum"])
+            
+            grad_shape = updated_grads.shape
+            ref_param = params[0]
+            param_shape = ref_param.shape
+            
+            # Handle attn param reshaping
+            if ref_param.label == 'attn':
+                for p in params:
+                    assert p.label == 'attn'
+                updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
+            
+            # Initialize second momentum buffer if needed
+            if "second_momentum_buffer" not in group:
+                group["second_momentum_buffer"] = (
+                    torch.zeros_like(updated_grads[..., :, :1])
+                    if param_shape[-2] >= param_shape[-1] 
+                    else torch.zeros_like(updated_grads[..., :1, :])
+                )
+            second_momentum_buffer = group["second_momentum_buffer"]
+            
+            # Initialize learning rate multipliers if needed
+            if "param_lr" not in group:
+                group["param_lr"] = (
+                    max(1., param_shape[-2] / param_shape[-1]) ** 0.5
+                    * ref_param.new_tensor(
+                        [getattr(param, "lr_mul", 1.0) for param in params]
+                    ).view(-1, 1, 1)
+                )
+                group["param_wd"] = ref_param.new_tensor(
+                    [getattr(param, "wd_mul", 1.0) for param in params]
+                ).view(-1, 1, 1)
+            
+            # Compute effective LR and weight decay
+            eff_lr = group["lr"] * group["param_lr"]
+            eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
+            
+            # Apply Polar Express orthogonalization
+            v_chunk = polar_express(updated_grads)
+            
+            # NorMuon: track squared magnitude along one dimension
+            v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
+            v_mean = v_chunk.square().mean(
+                dim=-1 if param_shape[-2] >= param_shape[-1] else -2, 
+                keepdim=True
+            )
+            second_momentum_buffer.lerp_(v_mean.to(dtype=ref_param.dtype), 1 - group["beta2"])
+            step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
+            v_chunk.mul_(step_size)
+            v_norm_new = v_chunk.norm(dim=(-2, -1), keepdim=True)
+            v_chunk.mul_(v_norm / v_norm_new.clamp_min_(1e-10))
+            
+            # Reshape back if needed
+            v_chunk = v_chunk.view(grad_shape)
+            
+            # Stack parameters
+            param_chunk = torch.stack(params)
+            
+            # "Cautious" weight decay
+            mask = (v_chunk * param_chunk) >= 0
+            v_chunk.addcmul_(param_chunk, (eff_wd * mask).to(ref_param.dtype))
+            
+            # Update parameters
+            param_chunk.addcmul_(v_chunk, -eff_lr)
+            
+            # Write back to original parameters
+            for i, p in enumerate(params):
+                p.copy_(param_chunk[i])
+
+class DistAdam(torch.optim.AdamW):
+    """Simplified AdamW for single GPU - replaces the distributed version"""
+    def __init__(self, params, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), 
+                 eps: float = 1e-8, weight_decay: float = 0.01):
+        super().__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        self.should_sync = False  # Keep this attribute for compatibility
+    
+    def step(self):
+        # Just call the parent class step
+        super().step()
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the model
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
+class CastedLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+        super().__init__(in_features, out_features, bias=False)
+        # Disable FP8 by default for 4070 compatibility
+        self.use_fp8 = False  # Force disable FP8 for Ada Lovelace
+        self.x_s = x_s
+        self.w_s = w_s
+        self.grad_s = grad_s
+
+    def reset_parameters(self) -> None:
+        with torch.no_grad():
+            self.weight.zero_()
+
+    def forward(self, x: Tensor):
+        # Always use standard linear (BF16)
+        return F.linear(x, self.weight.type_as(x))
+
+# yarn implementation @classiclarryd
+class Yarn(nn.Module):
+    def __init__(self, head_dim, max_seq_len):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.reset()
+        
+    def reset(self):
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=self.head_dim//4, dtype=torch.float32, device=device)
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(self.head_dim//4)])
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=device)
+        theta = torch.outer(t, angular_freq)
+        self.cos = nn.Buffer(
+            theta.cos().to(torch.bfloat16), persistent=False
+        )
+        self.sin = nn.Buffer(
+            theta.sin().to(torch.bfloat16), persistent=False
+        )
+        self.angular_freq = angular_freq
+        # start with 0.1, inspired by 0.12 from @leloykun and learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        self.attn_scale = 0.1
+
+    def apply(self, old_window: int, new_window: int, alpha: int=1, beta: int=32):
+        rotations = args.block_size * old_window * self.angular_freq / (2 * torch.pi)
+        scaling_factor = old_window / new_window
+        interpolation_weight = torch.clamp((rotations - alpha) / (beta - alpha), 0, 1)
+        self.angular_freq *= scaling_factor + interpolation_weight * (1 - scaling_factor)
+        t = torch.arange(self.max_seq_len, dtype=torch.float32, device=self.angular_freq.device)
+        theta = torch.outer(t, self.angular_freq)
+        self.cos.copy_(theta.cos())
+        self.sin.copy_(theta.sin())
+        self.attn_scale *= 0.2 * math.log(new_window / old_window) + 1
+
+def rotary(x_BTHD: Tensor, cos: Tensor, sin: Tensor):
+    assert cos.size(0) >= x_BTHD.size(-3)
+    cos, sin = (
+        cos[None, : x_BTHD.size(-3), None, :],
+        sin[None, : x_BTHD.size(-3), None, :],
+    )
+    x1, x2 = x_BTHD.chunk(2, dim=-1)
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat((y1, y2), 3)
+
+@dataclass
+class AttnArgs:
+    ve: torch.Tensor
+    sa_lambdas: torch.Tensor
+    seqlens: torch.Tensor
+    bm_size: int
+    cos: torch.Tensor
+    sin: torch.Tensor
+    attn_scale: float
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dim = dim
+        self.hdim = num_heads * head_dim
+
+        assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
+        std = 0.5 * (self.dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        # make matrices the same shape as MLP to enable batched call in optimizer
+        self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
+        # label module to enable custom optimizer sizing
+        self.qkvo_w.label='attn'
+        with torch.no_grad():
+            self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound) # init QKV weights
+            self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_() # init output weights to zero
+
+        # sparse gated attention to enable context based no-op by @classiclarryd
+        self.attn_gate = CastedLinear(12, num_heads)
+        # label module to enable custom optimizer sizing
+        self.attn_gate.weight.label = 'attn_gate'
+        self.attn_gate.weight.detach().zero_()
+
+    def forward(self, x: Tensor, attn_args: AttnArgs):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "varlen sequences requires B == 1"
+        assert T % 16 == 0
+        # unpack attention args
+        cos, sin = attn_args.cos, attn_args.sin
+        ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
+        seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
+
+        q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+        if ve is not None:
+            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = sa_lambdas[0] * v
+
+        max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
+
+        # Reshape for standard attention: [1, T, H, D] -> [1, H, T, D]
+        q_attn = q.transpose(1, 2)  # [B, H, T, D]
+        k_attn = k.transpose(1, 2)
+        v_attn = v.transpose(1, 2)
+
+        # Use PyTorch's native Flash Attention 2 (works on 4070)
+        y = F.scaled_dot_product_attention(
+            q_attn, k_attn, v_attn,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=attn_scale
+        )
+
+        # Reshape back: [B, H, T, D] -> [B, T, H, D]
+        y = y.transpose(1, 2).contiguous()
+
+        y = y.view(B, T, self.num_heads, self.head_dim)
+        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
+        return y
+
+class MegaBlocksMoEMLP(nn.Module):
+    """
+    MoE MLP using MegaBlocks library for optimized sparse computation.
+    Uses GLU activation and FP16 (MegaBlocks doesn't support BF16 properly)
+    """
+    def __init__(self, dim: int, num_experts: int = 4, top_k: int = 1):
+        super().__init__()
+        self.dim = dim
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.hidden_dim = 4 * dim
+        
+        # Create MegaBlocks MoE arguments
+        self.moe_args = MoEArguments(
+            hidden_size=dim,
+            ffn_hidden_size=self.hidden_dim,
+            moe_num_experts=num_experts,
+            moe_top_k=top_k,
+            moe_capacity_factor=1.25,
+            moe_normalize_expert_weights=1,
+            mlp_impl="grouped",
+            mlp_type="glu",
+            bf16=False,
+            fp16=True,
+            device=torch.cuda.current_device(),
+        )
+        
+        # MegaBlocks MoE layer
+        self.moe = moe.MoE(self.moe_args)
+        
+        # DON'T call .half() here - do it after model creation
+        
+        # Label parameters for optimizer
+        for name, param in self.moe.named_parameters():
+            if 'router' in name or 'gate' in name:
+                param.label = 'moe_router'
+            else:
+                param.label = 'moe_expert'
+    
+    def forward(self, x: Tensor):
+        """
+        Input: x [Batch, SeqLen, Dim] in BFloat16
+        Returns: output, aux_loss_dict in BFloat16
+        """
+        B, T, D = x.shape
+        
+        # Convert BF16 -> FP16 for MegaBlocks compatibility
+        x_fp16 = x.to(torch.float16)
+        
+        # MegaBlocks expects [SeqLen, Batch, Dim] format
+        x_transposed = x_fp16.transpose(0, 1)  # [T, B, D]
+        
+        # Forward through MegaBlocks MoE
+        output, aux_loss = self.moe(x_transposed)
+        
+        # Transpose back [T, B, D] -> [B, T, D] and convert FP16 -> BF16
+        output = output.transpose(0, 1).to(torch.bfloat16)
+        
+        # CRITICAL FIX: Ensure aux_loss is scalar
+        if aux_loss is not None and aux_loss.numel() > 1:
+            aux_loss = aux_loss.mean()  # Reduce to scalar
+        
+        # Create auxiliary loss dict
+        aux_loss_dict = {
+            'load_balancing_loss': aux_loss if aux_loss is not None else torch.tensor(0.0, device=x.device),
+            'router_z_loss': torch.tensor(0.0, device=x.device),
+        }
+        
+        return output, aux_loss_dict
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        # make matrices the same shape to enable batched call in optimizer
+        self.c_fc = nn.Parameter(torch.empty(dim, hdim))
+        self.c_proj = nn.Parameter(torch.empty(dim, hdim))
+        # label modules to enable custom optimizer sizing
+        self.c_fc.label='mlp'
+        self.c_proj.label='mlp'
+        std = 0.5 * (dim ** -0.5)
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        with torch.no_grad():
+            self.c_fc.uniform_(-bound, bound)
+            self.c_proj.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x: Tensor):
+        x = F.linear(x, self.c_fc.T.type_as(x))
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.linear(x, self.c_proj.type_as(x))
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, use_moe: bool = False, num_experts: int = 4):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
+        
+        if layer_idx != 0:
+            if use_moe:
+                # Use MegaBlocks MoE
+                self.mlp = MegaBlocksMoEMLP(dim, num_experts=num_experts, top_k=1)
+            else:
+                self.mlp = MLP(dim)
+        else:
+            self.mlp = None
+        
+        self.use_moe = use_moe and layer_idx != 0  # Track if this block uses MoE
+
+    def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
+        x = lambdas[0] * x + lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn(norm(x), attn_args)
+        if self.mlp is not None:
+            if self.use_moe:
+                mlp_out, aux_loss_dict = self.mlp(norm(x))
+                x = x + mlp_out
+                return x, aux_loss_dict
+            else:
+                x = x + self.mlp(norm(x))
+                return x, None
+        return x, None
+
+# -----------------------------------------------------------------------------
+# The main model
+
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, 
+                 model_dim: int, max_seq_len: int, use_moe: bool = False, num_experts: int = 4):
+        super().__init__()
+        vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.smear_gate = CastedLinear(12, 1)
+        self.smear_gate.weight.detach().zero_()
+        self.smear_gate.weight.label = 'smear_gate'
+        
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
+        
+        # Create blocks with optional MoE
+        self.blocks = nn.ModuleList([
+            Block(model_dim, head_dim, num_heads, i, use_moe=use_moe, num_experts=num_experts) 
+            for i in range(num_layers)
+        ])
+        
+        self.yarn = Yarn(head_dim, max_seq_len)
+        use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=use_fp8, 
+                                    x_s=(model_dim**0.5)/448, w_s=2**-9, grad_s=1/448)
+        self.lm_head.weight.detach().zero_()
+        
+        # Rest of __init__ remains the same...
+        assert num_layers % 2 == 0
+        pad = 0  # No padding for world_size=1
+        self.scalars = nn.Parameter(
+            torch.cat(
+                [
+                    -1.5 * torch.ones(num_layers),
+                    *[torch.tensor([1.0, 0.0]) for _ in range(num_layers)],
+                    *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)],
+                    torch.zeros(1),
+                    0.5*torch.ones(1),
+                    torch.ones(pad),
+                ]
+            )
+        )
+        
+        # Set learning rates
+        for param in self.embed.parameters():
+            param.lr_mul = 75.
+        for param in self.value_embeds.parameters():
+            param.lr_mul = 75.
+        self.lm_head.weight.lr_mul = 1.0
+        self.scalars.lr_mul = 5.0
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
+        assert input_seq.ndim == 1
+
+        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        assert len(ve) == len(self.blocks)
+
+        short_bm = ws_short * args.block_size
+        long_bm = ws_long * args.block_size
+        bm_sizes = [None, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, None, short_bm, short_bm, short_bm, long_bm]
+        assert len(bm_sizes) == len(self.blocks)
+
+        x = self.embed(input_seq)
+
+        smear_lambda = self.scalars[5 * len(self.blocks)]
+        smear_gate_out = smear_lambda * torch.sigmoid(self.smear_gate(x[1:, :self.smear_gate.weight.size(-1)]))
+        x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
+        x = x0 = norm(x[None])
+
+        skip_connections = []
+        skip_weights = self.scalars[:(len(self.blocks) // 2)]
+        lambdas = self.scalars[1 * len(self.blocks): 3 * len(self.blocks)].view(-1, 2)
+        sa_lambdas = self.scalars[3 * len(self.blocks): 5 * len(self.blocks)].view(-1, 2)
+        backout_lambda = self.scalars[5 * len(self.blocks)+1]
+
+        n = len(self.blocks) // 2
+        x_backout = None
+        backout_layer = 8
+        
+        # Accumulate MoE auxiliary losses
+        total_aux_loss = 0.0
+        moe_layer_count = 0
+        
+        # skip layer zero
+        for i in range(1, len(self.blocks)):
+            attn_args = AttnArgs(
+                ve=ve[i],
+                sa_lambdas=sa_lambdas[i],
+                seqlens=seqlens,
+                bm_size=bm_sizes[i],
+                cos=self.yarn.cos,
+                sin=self.yarn.sin,
+                attn_scale=self.yarn.attn_scale
+            )
+            
+            if i >= n and i < 11:
+                gate = torch.sigmoid(skip_weights[i - n])
+                x = x + gate * skip_connections.pop()
+            
+            x, aux_loss_dict = self.blocks[i](x, x0, lambdas[i], attn_args)
+            
+            # Accumulate MoE auxiliary losses
+            if aux_loss_dict is not None:
+                moe_layer_count += 1
+                # No need for .mean() check here since it's already fixed in MegaBlocksMoEMLP
+                total_aux_loss += aux_loss_dict['load_balancing_loss']
+            
+            if i < n:
+                skip_connections.append(x)
+            if i == backout_layer:
+                x_backout = x
+
+        # Average auxiliary loss across MoE layers
+        if moe_layer_count > 0:
+            total_aux_loss = total_aux_loss / moe_layer_count
+
+        x -= backout_lambda * x_backout
+        x = norm(x)
+        # Flatten to [T, 768]
+        x_flat = x.view(-1, x.size(-1))
+
+        logits = self.lm_head(x_flat)  # Should be [T, vocab_size]
+
+        logits = 30 * torch.sigmoid(logits / 7.5)
+        logits_for_loss = logits.float() if not self.training else logits
+
+        # Main cross-entropy loss
+        ce_loss = F.cross_entropy(
+            logits_for_loss,  # [T, vocab_size]
+            target_seq,       # [T]
+            reduction="sum" if self.training else "mean",
+        )
+        
+        # Combine main loss with auxiliary loss
+        if self.training and moe_layer_count > 0:
+            total_loss = ce_loss + args.moe_aux_loss_weight * total_aux_loss
+        else:
+            total_loss = ce_loss
+        
+        # DEBUG
+        # print(f"ce_loss shape: {ce_loss.shape}, value: {ce_loss.item() if ce_loss.numel() == 1 else 'NOT SCALAR'}")
+        # print(f"total_loss shape: {total_loss.shape}, value: {total_loss.item() if total_loss.numel() == 1 else 'NOT SCALAR'}")
+        # print(f"total_loss has {total_loss.numel()} elements")
+        
+        return total_loss
+
+# -----------------------------------------------------------------------------
+# Data loader (same as before)
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32)
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2])
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy())
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+BOS_ID = 50256
+
+class BOSFinder:
+    def __init__(self, tokens: Tensor, world_size: int = 1, quickload: bool = False):
+        self.tokens=tokens
+        self.size = tokens.numel()
+        self.quickload = quickload
+        if quickload:
+            self.bos_idx = (tokens[:4_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+            self.thread = None
+            self.ready = threading.Event()
+            self.start()
+        else:
+            self.bos_idx = (tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.i = 0
+        self.world_size = world_size
+        self.batch_iter = 0
+
+    def _load(self):
+        self.bos_idx_async = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self.ready.set()
+    
+    def start(self):
+        self.ready.clear()
+        self.thread = threading.Thread(target=self._load)
+        self.thread.start()
+    
+    def get(self):
+        if self.thread:
+            self.ready.wait()
+            self.thread.join()
+        self.bos_idx = self.bos_idx_async
+
+    def next_batch(self, num_tokens_local: int, max_seq_len: int):
+        if self.quickload and self.batch_iter==5:
+            self.get()
+        n = len(self.bos_idx)
+        starts = [[] for _ in range(self.world_size)]
+        ends = [[] for _ in range(self.world_size)]
+
+        idx = self.i
+        for r in range(self.world_size):
+            cur_len = 0
+            while cur_len <= num_tokens_local:
+                if idx >= n:
+                    raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
+                cur = self.bos_idx[idx]
+                starts[r].append(cur)
+                end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
+                          cur + max_seq_len,
+                          cur + num_tokens_local - cur_len + 1)
+                ends[r].append(end)
+                cur_len += end - cur
+                idx += 1
+
+            assert cur_len == num_tokens_local + 1
+        self.i = idx
+        self.batch_iter+=1
+        return starts, ends
+
+class DataPreloader:
+    def __init__(self, file_iter, world_size: int = 1):
+        self.file_iter = file_iter
+        self.world_size = world_size
+        self.thread = None
+        self.data = None
+        self.ready = threading.Event()
+    
+    def _load(self):
+        tokens = _load_data_shard(next(self.file_iter))
+        self.data = (tokens, BOSFinder(tokens, self.world_size))
+        self.ready.set()
+    
+    def start(self):
+        self.ready.clear()
+        self.thread = threading.Thread(target=self._load)
+        self.thread.start()
+    
+    def get(self):
+        if self.thread:
+            self.ready.wait()
+            self.thread.join()
+        return self.data
+
+def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, grad_accum_steps: int = 1, align_to_bos: bool = True):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    assert num_tokens % (world_size * grad_accum_steps) == 0, "Batch size must be divisible by world size"
+    num_tokens = num_tokens // grad_accum_steps
+
+    files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+
+    file_iter = iter(files)
+    tokens = _load_data_shard(next(file_iter))
+    if align_to_bos:
+        finder = BOSFinder(tokens, world_size=world_size, quickload=True)
+        preloader = DataPreloader(file_iter, world_size)
+        preloader.start()
+    else:
+        pos = 0
+
+    while True:
+        num_tokens_local = num_tokens
+
+        max_num_docs = next_multiple_of_n(num_tokens_local // 300, n=128)
+
+        if align_to_bos:
+            try:
+                seq_starts, seq_ends = finder.next_batch(num_tokens_local, max_seq_len)
+                start_idxs, end_idxs = torch.tensor(seq_starts[0]), torch.tensor(seq_ends[0])
+            except StopIteration:
+                tokens, finder = preloader.get()
+                preloader.start()
+                continue
+
+            buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+            _inputs = buf[:-1]
+            _targets = buf[1:]
+            end_idxs[-1] -= 1
+            cum_lengths = (end_idxs - start_idxs).cumsum(0)
+
+        else:
+            if pos + num_tokens + 1 >= len(tokens):
+                tokens, pos = _load_data_shard(next(file_iter)), 0
+
+            pos_local = pos
+            buf = tokens[pos_local: pos_local + num_tokens_local + 1]
+            _inputs = buf[:-1].view(num_tokens_local, )
+            _targets = buf[1:].view(num_tokens_local, )
+
+            cum_lengths = torch.nonzero(_inputs == BOS_ID)[:, 0]
+            pos += num_tokens
+
+
+        _cum_lengths = torch.full((max_num_docs,), num_tokens_local)
+        _cum_lengths[0] = 0
+        _cum_lengths[1:len(cum_lengths) + 1] = cum_lengths
+
+        new_params = yield (
+            _inputs.to(device="cuda", dtype=torch.int32, non_blocking=True),
+            _targets.to(device="cuda", dtype=torch.int64, non_blocking=True),
+            _cum_lengths.to(device="cuda", dtype=torch.int32, non_blocking=True)
+        )
+
+        if new_params is not None:
+            new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
+            assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
+            num_tokens = new_num_tokens
+            max_seq_len = new_max_seq_len
+            grad_accum_steps = new_grad_accum_steps
+
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin"
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin"
+    val_tokens: int = 524288
+    
+    # Batch sizes
+    train_batch_size: int = 4096
+    train_max_seq_len: int = 1024
+    val_batch_size: int = 4096
+    
+    # optimization
+    num_scheduled_iterations: int = 11500
+    num_extension_iterations: int = 500
+    num_iterations: int = num_scheduled_iterations + num_extension_iterations
+    cooldown_frac: float = 0.50
+    
+    # evaluation and logging
+    run_id: str = f"{uuid.uuid4()}"
+    val_loss_every: int = 250
+    save_checkpoint: bool = False
+    
+    # attention masking
+    block_size: int = 128
+    ws_schedule: tuple = (3, 7, 11)
+    ws_final: int = 13
+    ws_validate_post_yarn_ext: int = 20
+
+    # MoE-specific hyperparameters
+    moe_aux_loss_weight: float = 0.001
+    moe_num_experts: int = 4
+
+args = Hyperparameters()
+
+data_path = os.environ.get("DATA_PATH", ".")
+args.train_files = os.path.join(data_path, args.train_files)
+args.val_files = os.path.join(data_path, args.val_files)
+
+# Single GPU setup
+rank = 0
+world_size = 1
+grad_accum_steps = 1
+assert torch.cuda.is_available()
+device = torch.device("cuda", 0)
+torch.cuda.set_device(device)
+master_process = True
+
+# begin logging
+logfile = None
+if master_process:
+    run_id = args.run_id
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{run_id}.txt"
+    print(logfile)
+    
+def print0(s, console=False):
+    if master_process:
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
+
+print0(code)
+print0("="*100)
+print0(f"Running Python {sys.version}")
+print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+print0(f"Running Triton version {triton.__version__}")
+import importlib.metadata
+try:
+    version = importlib.metadata.version("megablocks")
+except:
+    version = "unknown"
+print0(f"Running MegaBlocks version {version}")
+
+def nvidia_smi():
+    import subprocess
+    return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+print0(nvidia_smi())
+print0("="*100)
+
+model: nn.Module = GPT(
+    vocab_size=50257,
+    num_layers=12,
+    num_heads=6,
+    head_dim=128,
+    model_dim=768,
+    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size),
+    use_moe=True,
+    num_experts=args.moe_num_experts
+).cuda()
+
+# Convert to bfloat16 (skip MegaBlocks modules)
+for m in model.modules():
+    if isinstance(m, MegaBlocksMoEMLP):
+        continue  # Skip MegaBlocks
+    if isinstance(m, (nn.Embedding, nn.Linear)):
+        m.bfloat16()
+
+# Convert MegaBlocks modules to FP16 (must happen AFTER bfloat16 conversion)
+for m in model.modules():
+    if isinstance(m, MegaBlocksMoEMLP):
+        m.moe.half()
+        # print0(f"Converted MegaBlocks MoE to FP16", console=True)
+
+# Collect parameters for optimizers - MUTUALLY EXCLUSIVE GROUPS
+# Step 1: Identify all MoE parameters first
+router_param_ids = {id(p) for n, p in model.named_parameters() if "router" in n}
+expert_param_ids = {id(p) for n, p in model.named_parameters() if "expert" in n}
+moe_param_ids = router_param_ids | expert_param_ids
+
+# Step 2: Collect MoE parameters
+router_params = [p for n, p in model.named_parameters() if "router" in n]
+expert_params = [p for n, p in model.named_parameters() if "expert" in n]
+
+# Step 3: Collect non-MoE parameters (excluding anything in MoE)
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() 
+                        if p.ndim >= 2 
+                        and id(p) not in moe_param_ids
+                        and "embed" not in n 
+                        and "gate" not in n]
+
+embed_params = [p for n, p in model.named_parameters() 
+                if "embed" in n and id(p) not in moe_param_ids]
+
+scalar_params = [p for p in model.parameters() 
+                 if p.ndim < 2 and id(p) not in moe_param_ids]
+
+head_params = [model.lm_head.weight] if id(model.lm_head.weight) not in moe_param_ids else []
+
+gate_params = [p for n, p in model.named_parameters() 
+               if "gate" in n and id(p) not in moe_param_ids]
+
+# Debug: Print param counts
+print0(f"Parameter groups:", console=True)
+print0(f"  Router params: {len(router_params)}", console=True)
+print0(f"  Expert params: {len(expert_params)}", console=True)
+print0(f"  Hidden matrix params: {len(hidden_matrix_params)}", console=True)
+print0(f"  Embed params: {len(embed_params)}", console=True)
+print0(f"  Scalar params: {len(scalar_params)}", console=True)
+print0(f"  Head params: {len(head_params)}", console=True)
+print0(f"  Gate params: {len(gate_params)}", console=True)
+
+# init the optimizer(s)
+optimizer1 = DistAdam([
+    {'params': scalar_params + head_params + embed_params + gate_params + expert_params, 'lr': 0.004},
+    {'params': router_params, 'lr': 0.001},
+], betas=(0.65, 0.95), eps=1e-8, weight_decay=0.0)
+
+optimizer2 = NorMuon(
+    hidden_matrix_params,
+    lr=0.015, 
+    momentum=0.95, 
+    beta2=0.95, 
+    weight_decay=1.2,
+    custom_sizing=False
+)
+
+optimizers = [optimizer1, optimizer2]
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
+
+# learning rate schedule
+def get_lr(step: int):
+    x = min(0.9999, step / args.num_iterations)
+    assert 0 <= x < 1
+    lr = 1.0
+    if x >= 1 - args.cooldown_frac:
+        w = (1 - x) / args.cooldown_frac
+        lr = w * 1.0 + (1 - w) * 0.1
+    return lr
+
+def get_ws(step: int):
+    if step >= args.num_scheduled_iterations:
+        return args.ws_final // 2, args.ws_final
+    x = step / args.num_scheduled_iterations
+    assert 0 <= x < 1
+    ws_idx = int(len(args.ws_schedule) * x)
+    return args.ws_schedule[ws_idx] // 2, args.ws_schedule[ws_idx]
+
+def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, momentum_min=0.85, momentum_max=0.95):
+    momentum_cd_start = args.num_iterations - muon_cooldown_steps
+    if step < muon_warmup_steps:
+        frac = step / muon_warmup_steps
+        momentum = momentum_min + frac * (momentum_max - momentum_min)
+    elif step > momentum_cd_start:
+        frac = (step - momentum_cd_start) / muon_cooldown_steps
+        momentum = momentum_max - frac * (momentum_max - momentum_min)
+    else:
+        momentum = momentum_max
+    return momentum
+
+def step_optimizers(step: int, optimizers, model):
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * get_lr(step)
+
+    momentum = get_muon_momentum(step)
+    for group in optimizers[1].param_groups:
+        group["momentum"] = momentum
+
+    if step%2==0:
+        optimizers[1].step()
+        optimizers[1].zero_grad(set_to_none=True)
+    else:
+        for optimizer in optimizers:
+            optimizer.step()
+        model.zero_grad(set_to_none=True)
+
+# Compile - MegaBlocks may not be fully compatible with torch.compile
+# Try without compilation first
+# model: nn.Module = torch.compile(model, dynamic=True, fullgraph=False)
+
+########################################
+#            Warmup kernels            #
+########################################
+
+warmup_steps = 30
+# Don't save/restore state for MegaBlocks - just reset optimizers
+train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+for step in range(warmup_steps):
+    inputs, targets, cum_seqlens = next(train_loader)
+    ws_idx = step % len(args.ws_schedule)
+    if ws_idx==0:
+        model.yarn.reset()
+        ws_long = args.ws_schedule[0]
+    else:
+        new_ws_long = args.ws_schedule[ws_idx]  
+        if new_ws_long != ws_long:
+            model.yarn.apply(ws_long, new_ws_long)
+            ws_long = new_ws_long
+    
+    loss = model(inputs, targets, cum_seqlens, ws_long//2, ws_long)
+    # print0(f"Warmup step {step}, loss: {loss.item()}", console=True)  # Debug print
+    loss.backward()
+    
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+
+# Reset everything
+model.yarn.reset()
+for opt in optimizers:
+    opt.zero_grad(set_to_none=True)
+    for group in opt.param_groups:
+        for p in group['params']:
+            if 'momentum_buffer' in opt.state[p]:
+                opt.state[p]['momentum_buffer'].zero_()
+            if 'exp_avg' in opt.state[p]:
+                opt.state[p]['exp_avg'].zero_()
+            if 'exp_avg_sq' in opt.state[p]:
+                opt.state[p]['exp_avg_sq'].zero_()
+
+del train_loader
+
+########################################
+#        Training and validation       #
+########################################
+
+train_loader = distributed_data_generator(args.train_files, args.train_batch_size, args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
+training_time_ms = 0
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+train_steps = args.num_iterations
+ws_short, ws_long = get_ws(0)
+for step in range(train_steps + 1):
+    last_step = (step == train_steps)
+    ws_short, new_ws_long = get_ws(step)
+    if new_ws_long != ws_long:
+        model.yarn.apply(ws_long, new_ws_long)
+        ws_long=new_ws_long
+
+    # --------------- VALIDATION SECTION -----------------
+    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step:
+            ws_long = args.ws_validate_post_yarn_ext
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.perf_counter() - t0)
+        model.eval()
+        assert args.val_tokens % args.val_batch_size == 0
+        val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+        val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+        val_loss = 0
+        with torch.no_grad():
+            for _ in range(val_steps):
+                inputs, targets, cum_seqlens = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, ws_short, ws_long)
+        val_loss /= val_steps
+        del val_loader
+        
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        model.train()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+    if last_step:
+        if master_process and args.save_checkpoint:
+            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    for _ in range(grad_accum_steps):
+        inputs, targets, cum_seqlens = next(train_loader)
+        model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
+    step_optimizers(step, optimizers, model)
+     
+    approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+       f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+====================================================================================================
+Running Python 3.10.19 (main, Oct 21 2025, 16:43:05) [GCC 11.2.0]
+Running PyTorch 2.7.0+cu126 compiled for CUDA 12.6
+Running Triton version 3.3.0
+Running MegaBlocks version 0.11.0.dev0
+Sun Dec  7 00:15:02 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.105.08             Driver Version: 580.105.08     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4070        On  |   00000000:43:00.0 Off |                  N/A |
+|  0%   45C    P2             31W /  200W |     189MiB /  12282MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A         1184778      C   python                                  180MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+Parameter groups:
+  Router params: 11
+  Expert params: 33
+  Hidden matrix params: 10
+  Embed params: 4
+  Scalar params: 1
+  Head params: 1
+  Gate params: 11
+step:0/12000 val_loss:nan train_time:0ms step_avg:0.10ms
+step:1/12000 train_time:651ms step_avg:650.77ms
+step:2/12000 train_time:1014ms step_avg:507.20ms
+step:3/12000 train_time:1367ms step_avg:455.54ms
+step:4/12000 train_time:1714ms step_avg:428.45ms
+step:5/12000 train_time:2070ms step_avg:413.91ms
+step:6/12000 train_time:2420ms step_avg:403.40ms
+step:7/12000 train_time:2778ms step_avg:396.93ms
+step:8/12000 train_time:3131ms step_avg:391.34ms
+step:9/12000 train_time:3489ms step_avg:387.62ms
+step:10/12000 train_time:3841ms step_avg:384.05ms
+step:11/12000 train_time:4199ms step_avg:381.73ms
+step:12/12000 train_time:4550ms step_avg:379.20ms
+step:13/12000 train_time:4916ms step_avg:378.13ms
+step:14/12000 train_time:5269ms step_avg:376.33ms
+step:15/12000 train_time:5627ms step_avg:375.15ms
+step:16/12000 train_time:5980ms step_avg:373.76ms
+step:17/12000 train_time:6339ms step_avg:372.87ms
+step:18/12000 train_time:6691ms step_avg:371.72ms
+step:19/12000 train_time:7052ms step_avg:371.14ms
+step:20/12000 train_time:7405ms step_avg:370.23ms
+step:21/12000 train_time:7768ms step_avg:369.90ms
+step:22/12000 train_time:8121ms step_avg:369.15ms
+step:23/12000 train_time:8479ms step_avg:368.67ms
+step:24/12000 train_time:8859ms step_avg:369.15ms
+step:25/12000 train_time:9220ms step_avg:368.80ms
+step:26/12000 train_time:9572ms step_avg:368.16ms
+step:27/12000 train_time:9935ms step_avg:367.98ms
+step:28/12000 train_time:10289ms step_avg:367.47ms
+step:29/12000 train_time:10648ms step_avg:367.18ms
+step:30/12000 train_time:11007ms step_avg:366.89ms
+step:31/12000 train_time:11364ms step_avg:366.58ms
+step:32/12000 train_time:11716ms step_avg:366.13ms
+step:33/12000 train_time:12075ms step_avg:365.89ms
+step:34/12000 train_time:12428ms step_avg:365.52ms
+step:35/12000 train_time:12793ms step_avg:365.51ms
+step:36/12000 train_time:13147ms step_avg:365.19ms
+step:37/12000 train_time:13505ms step_avg:365.01ms
+step:38/12000 train_time:13858ms step_avg:364.68ms
+step:39/12000 train_time:14217ms step_avg:364.54ms
+step:40/12000 train_time:14570ms step_avg:364.24ms
+step:41/12000 train_time:14928ms step_avg:364.10ms
+step:42/12000 train_time:15281ms step_avg:363.84ms
+step:43/12000 train_time:15640ms step_avg:363.71ms
+step:44/12000 train_time:15996ms step_avg:363.55ms
+step:45/12000 train_time:16354ms step_avg:363.43ms
+step:46/12000 train_time:16706ms step_avg:363.18ms
+step:47/12000 train_time:17067ms step_avg:363.12ms
+step:48/12000 train_time:17420ms step_avg:362.92ms
+step:49/12000 train_time:17780ms step_avg:362.85ms
+step:50/12000 train_time:18132ms step_avg:362.63ms
+step:51/12000 train_time:18490ms step_avg:362.55ms
+step:52/12000 train_time:18844ms step_avg:362.38ms
+step:53/12000 train_time:19202ms step_avg:362.30ms
+step:54/12000 train_time:19555ms step_avg:362.13ms
+step:55/12000 train_time:19914ms step_avg:362.08ms
+step:56/12000 train_time:20267ms step_avg:361.91ms
+step:57/12000 train_time:20625ms step_avg:361.85ms
+step:58/12000 train_time:20984ms step_avg:361.79ms
+step:59/12000 train_time:21344ms step_avg:361.75ms
+step:60/12000 train_time:21697ms step_avg:361.61ms
+step:61/12000 train_time:22056ms step_avg:361.57ms
+step:62/12000 train_time:22415ms step_avg:361.54ms
+step:63/12000 train_time:22773ms step_avg:361.47ms
+step:64/12000 train_time:23127ms step_avg:361.35ms
+step:65/12000 train_time:23489ms step_avg:361.37ms
+step:66/12000 train_time:23842ms step_avg:361.24ms
+step:67/12000 train_time:24201ms step_avg:361.22ms
+step:68/12000 train_time:24554ms step_avg:361.09ms
+step:69/12000 train_time:24913ms step_avg:361.06ms
+step:70/12000 train_time:25267ms step_avg:360.95ms
+step:71/12000 train_time:25626ms step_avg:360.93ms
+step:72/12000 train_time:25978ms step_avg:360.81ms
+step:73/12000 train_time:26338ms step_avg:360.79ms
+step:74/12000 train_time:26691ms step_avg:360.69ms
+step:75/12000 train_time:27052ms step_avg:360.69ms
+step:76/12000 train_time:27405ms step_avg:360.59ms
+step:77/12000 train_time:27764ms step_avg:360.58ms
+step:78/12000 train_time:28117ms step_avg:360.47ms
+step:79/12000 train_time:28475ms step_avg:360.44ms
+step:80/12000 train_time:28829ms step_avg:360.36ms
+step:81/12000 train_time:29188ms step_avg:360.34ms
+step:82/12000 train_time:29540ms step_avg:360.25ms
+step:83/12000 train_time:29898ms step_avg:360.22ms
+step:84/12000 train_time:30251ms step_avg:360.14ms
+step:85/12000 train_time:30611ms step_avg:360.13ms
+step:86/12000 train_time:30963ms step_avg:360.04ms
+step:87/12000 train_time:31322ms step_avg:360.03ms
+step:88/12000 train_time:31675ms step_avg:359.94ms
+step:89/12000 train_time:32033ms step_avg:359.92ms
+step:90/12000 train_time:32387ms step_avg:359.85ms
+step:91/12000 train_time:32745ms step_avg:359.84ms
+step:92/12000 train_time:33098ms step_avg:359.76ms
+step:93/12000 train_time:33457ms step_avg:359.76ms
+step:94/12000 train_time:33810ms step_avg:359.68ms
+step:95/12000 train_time:34170ms step_avg:359.69ms
+step:96/12000 train_time:34523ms step_avg:359.61ms
+step:97/12000 train_time:34883ms step_avg:359.61ms
+step:98/12000 train_time:35235ms step_avg:359.55ms
+step:99/12000 train_time:35594ms step_avg:359.53ms
+step:100/12000 train_time:35947ms step_avg:359.47ms
+step:101/12000 train_time:36307ms step_avg:359.47ms
+step:102/12000 train_time:36660ms step_avg:359.41ms
+step:103/12000 train_time:37019ms step_avg:359.41ms
+step:104/12000 train_time:37373ms step_avg:359.36ms
+step:105/12000 train_time:37732ms step_avg:359.35ms
+step:106/12000 train_time:38086ms step_avg:359.30ms
+step:107/12000 train_time:38445ms step_avg:359.30ms
+step:108/12000 train_time:38797ms step_avg:359.23ms
+step:109/12000 train_time:39155ms step_avg:359.22ms
+step:110/12000 train_time:39508ms step_avg:359.17ms
+step:111/12000 train_time:39868ms step_avg:359.17ms
+step:112/12000 train_time:40221ms step_avg:359.11ms
+step:113/12000 train_time:40580ms step_avg:359.12ms
+step:114/12000 train_time:40933ms step_avg:359.06ms
+step:115/12000 train_time:41292ms step_avg:359.06ms
+step:116/12000 train_time:41646ms step_avg:359.02ms
+step:117/12000 train_time:42005ms step_avg:359.02ms
+step:118/12000 train_time:42358ms step_avg:358.96ms
+step:119/12000 train_time:42717ms step_avg:358.96ms
+step:120/12000 train_time:43070ms step_avg:358.91ms
+step:121/12000 train_time:43430ms step_avg:358.92ms
+step:122/12000 train_time:43783ms step_avg:358.87ms
+step:123/12000 train_time:44142ms step_avg:358.88ms
+step:124/12000 train_time:44494ms step_avg:358.83ms
+step:125/12000 train_time:44853ms step_avg:358.83ms
+step:126/12000 train_time:45206ms step_avg:358.77ms
+step:127/12000 train_time:45565ms step_avg:358.78ms
+step:128/12000 train_time:45918ms step_avg:358.73ms
+step:129/12000 train_time:46277ms step_avg:358.74ms
+step:130/12000 train_time:46630ms step_avg:358.69ms
+step:131/12000 train_time:46990ms step_avg:358.70ms
+step:132/12000 train_time:47344ms step_avg:358.67ms
+step:133/12000 train_time:47702ms step_avg:358.66ms
+step:134/12000 train_time:48055ms step_avg:358.62ms
+step:135/12000 train_time:48414ms step_avg:358.63ms
+step:136/12000 train_time:48767ms step_avg:358.58ms
+step:137/12000 train_time:49126ms step_avg:358.59ms
+step:138/12000 train_time:49479ms step_avg:358.54ms
+step:139/12000 train_time:49838ms step_avg:358.55ms
+step:140/12000 train_time:50191ms step_avg:358.51ms
+step:141/12000 train_time:50550ms step_avg:358.51ms
+step:142/12000 train_time:50903ms step_avg:358.47ms
+step:143/12000 train_time:51263ms step_avg:358.48ms
+step:144/12000 train_time:51615ms step_avg:358.44ms
+step:145/12000 train_time:51975ms step_avg:358.45ms
+step:146/12000 train_time:52327ms step_avg:358.41ms
+step:147/12000 train_time:53118ms step_avg:361.34ms
+step:148/12000 train_time:53470ms step_avg:361.28ms
+step:149/12000 train_time:53826ms step_avg:361.25ms
+step:150/12000 train_time:54176ms step_avg:361.18ms
+step:151/12000 train_time:54533ms step_avg:361.14ms
+step:152/12000 train_time:54883ms step_avg:361.07ms
+step:153/12000 train_time:55243ms step_avg:361.07ms
+step:154/12000 train_time:55598ms step_avg:361.03ms
+step:155/12000 train_time:55957ms step_avg:361.01ms
+step:156/12000 train_time:56311ms step_avg:360.97ms
+step:157/12000 train_time:56669ms step_avg:360.95ms
+step:158/12000 train_time:57024ms step_avg:360.91ms
+step:159/12000 train_time:57383ms step_avg:360.90ms
+step:160/12000 train_time:57736ms step_avg:360.85ms
+step:161/12000 train_time:58095ms step_avg:360.84ms
+step:162/12000 train_time:58448ms step_avg:360.79ms
+step:163/12000 train_time:58808ms step_avg:360.78ms
+step:164/12000 train_time:59161ms step_avg:360.73ms
+step:165/12000 train_time:59525ms step_avg:360.76ms
+step:166/12000 train_time:59879ms step_avg:360.72ms
+step:167/12000 train_time:60237ms step_avg:360.70ms
+step:168/12000 train_time:60591ms step_avg:360.66ms
+step:169/12000 train_time:60951ms step_avg:360.65ms
+step:170/12000 train_time:61303ms step_avg:360.61ms
+step:171/12000 train_time:61662ms step_avg:360.60ms
+step:172/12000 train_time:62016ms step_avg:360.56ms
+step:173/12000 train_time:62375ms step_avg:360.55ms
+step:174/12000 train_time:62728ms step_avg:360.51ms
+step:175/12000 train_time:63087ms step_avg:360.49ms
+step:176/12000 train_time:63440ms step_avg:360.45ms
+step:177/12000 train_time:63799ms step_avg:360.45ms
+step:178/12000 train_time:64152ms step_avg:360.41ms
+step:179/12000 train_time:64512ms step_avg:360.40ms
+step:180/12000 train_time:64865ms step_avg:360.36ms
+step:181/12000 train_time:65225ms step_avg:360.36ms
+step:182/12000 train_time:65578ms step_avg:360.32ms
+step:183/12000 train_time:65938ms step_avg:360.32ms
+step:184/12000 train_time:66292ms step_avg:360.28ms
+step:185/12000 train_time:66650ms step_avg:360.27ms
+step:186/12000 train_time:67004ms step_avg:360.24ms
+step:187/12000 train_time:67365ms step_avg:360.24ms
+step:188/12000 train_time:67719ms step_avg:360.21ms
+step:189/12000 train_time:68084ms step_avg:360.23ms
+step:190/12000 train_time:68438ms step_avg:360.20ms
+step:191/12000 train_time:68796ms step_avg:360.19ms
+step:192/12000 train_time:69149ms step_avg:360.15ms
+step:193/12000 train_time:69517ms step_avg:360.19ms
+step:194/12000 train_time:69877ms step_avg:360.19ms
+step:195/12000 train_time:70284ms step_avg:360.43ms
+step:196/12000 train_time:70644ms step_avg:360.43ms
+step:197/12000 train_time:71007ms step_avg:360.44ms
+step:198/12000 train_time:71365ms step_avg:360.43ms
+step:199/12000 train_time:71728ms step_avg:360.44ms
+step:200/12000 train_time:72086ms step_avg:360.43ms
+step:201/12000 train_time:72449ms step_avg:360.44ms
+step:202/12000 train_time:72806ms step_avg:360.43ms
+step:203/12000 train_time:73169ms step_avg:360.44ms
+step:204/12000 train_time:73527ms step_avg:360.43ms
+step:205/12000 train_time:73889ms step_avg:360.44ms
+step:206/12000 train_time:74246ms step_avg:360.42ms
+step:207/12000 train_time:74610ms step_avg:360.43ms
+step:208/12000 train_time:74967ms step_avg:360.42ms
+step:209/12000 train_time:75341ms step_avg:360.48ms
+step:210/12000 train_time:75699ms step_avg:360.47ms
+step:211/12000 train_time:76061ms step_avg:360.48ms
+step:212/12000 train_time:76418ms step_avg:360.46ms
+step:213/12000 train_time:76781ms step_avg:360.48ms
+step:214/12000 train_time:77141ms step_avg:360.47ms
+step:215/12000 train_time:77503ms step_avg:360.48ms
+step:216/12000 train_time:77861ms step_avg:360.47ms
+step:217/12000 train_time:78224ms step_avg:360.48ms
+step:218/12000 train_time:78587ms step_avg:360.49ms
+step:219/12000 train_time:78950ms step_avg:360.50ms
+step:220/12000 train_time:79308ms step_avg:360.49ms
+step:221/12000 train_time:79671ms step_avg:360.50ms
+step:222/12000 train_time:80030ms step_avg:360.50ms
+step:223/12000 train_time:80393ms step_avg:360.51ms
+step:224/12000 train_time:80750ms step_avg:360.49ms
+step:225/12000 train_time:81113ms step_avg:360.50ms
+step:226/12000 train_time:81470ms step_avg:360.49ms
+step:227/12000 train_time:81834ms step_avg:360.50ms
+step:228/12000 train_time:82191ms step_avg:360.49ms
+step:229/12000 train_time:82554ms step_avg:360.50ms
+step:230/12000 train_time:82911ms step_avg:360.48ms
+step:231/12000 train_time:83273ms step_avg:360.49ms
+step:232/12000 train_time:83636ms step_avg:360.50ms
+step:233/12000 train_time:83998ms step_avg:360.50ms
+step:234/12000 train_time:84355ms step_avg:360.49ms
+step:235/12000 train_time:84718ms step_avg:360.50ms
+step:236/12000 train_time:85076ms step_avg:360.49ms
+step:237/12000 train_time:85441ms step_avg:360.51ms
+step:238/12000 train_time:85798ms step_avg:360.50ms
+step:239/12000 train_time:86162ms step_avg:360.51ms
+step:240/12000 train_time:86519ms step_avg:360.50ms
+step:241/12000 train_time:86910ms step_avg:360.62ms
+step:242/12000 train_time:87271ms step_avg:360.63ms
+step:243/12000 train_time:87634ms step_avg:360.63ms
+step:244/12000 train_time:87992ms step_avg:360.62ms
+step:245/12000 train_time:88356ms step_avg:360.64ms
+step:246/12000 train_time:88722ms step_avg:360.66ms
+step:247/12000 train_time:89085ms step_avg:360.67ms
+step:248/12000 train_time:89442ms step_avg:360.65ms
+step:249/12000 train_time:89805ms step_avg:360.66ms
+step:250/12000 train_time:90162ms step_avg:360.65ms
+step:250/12000 val_loss:nan train_time:90194ms step_avg:360.78ms
+step:251/12000 train_time:90460ms step_avg:360.40ms
+step:252/12000 train_time:90792ms step_avg:360.28ms
+step:253/12000 train_time:91154ms step_avg:360.29ms
+step:254/12000 train_time:91511ms step_avg:360.28ms
+step:255/12000 train_time:91874ms step_avg:360.29ms
+step:256/12000 train_time:92232ms step_avg:360.28ms
+step:257/12000 train_time:92594ms step_avg:360.29ms
+step:258/12000 train_time:92951ms step_avg:360.28ms
+step:259/12000 train_time:93315ms step_avg:360.29ms
+step:260/12000 train_time:93672ms step_avg:360.28ms
+step:261/12000 train_time:94035ms step_avg:360.29ms
+step:262/12000 train_time:94392ms step_avg:360.27ms
+step:263/12000 train_time:94755ms step_avg:360.28ms
+step:264/12000 train_time:95112ms step_avg:360.27ms
+step:265/12000 train_time:95475ms step_avg:360.28ms
+step:266/12000 train_time:95832ms step_avg:360.27ms
+step:267/12000 train_time:96195ms step_avg:360.28ms
+step:268/12000 train_time:96552ms step_avg:360.27ms
+step:269/12000 train_time:96916ms step_avg:360.28ms
+step:270/12000 train_time:97273ms step_avg:360.27ms
+step:271/12000 train_time:97636ms step_avg:360.28ms
+step:272/12000 train_time:97993ms step_avg:360.27ms
+step:273/12000 train_time:98356ms step_avg:360.28ms
+step:274/12000 train_time:98715ms step_avg:360.27ms
