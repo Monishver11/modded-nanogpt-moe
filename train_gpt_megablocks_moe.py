@@ -856,14 +856,18 @@ class GPT(nn.Module):
 
         x -= backout_lambda * x_backout
         x = norm(x)
-        logits = self.lm_head(x)
+        # Flatten to [T, 768]
+        x_flat = x.view(-1, x.size(-1))
+
+        logits = self.lm_head(x_flat)  # Should be [T, vocab_size]
+
         logits = 30 * torch.sigmoid(logits / 7.5)
         logits_for_loss = logits.float() if not self.training else logits
-        
+
         # Main cross-entropy loss
         ce_loss = F.cross_entropy(
-            logits_for_loss.view(-1, logits_for_loss.size(-1)),
-            target_seq,
+            logits_for_loss,  # [T, vocab_size]
+            target_seq,       # [T]
             reduction="sum" if self.training else "mean",
         )
         
