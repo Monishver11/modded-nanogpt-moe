@@ -1101,9 +1101,9 @@ class Hyperparameters:
     val_tokens: int = 524288
     
     # batch sizes
-    train_batch_size: int = 4096
+    train_batch_size: int = 2048
     train_max_seq_len: int = 1024
-    val_batch_size: int = 4096
+    val_batch_size: int = 2048
     
     # optimization
     num_scheduled_iterations: int = 11500
