@@ -1124,7 +1124,7 @@ class Hyperparameters:
 
     # DeepSeek MoE hyperparameters
     moe_aux_loss_weight: float = 0.01  # Auxiliary loss weight
-    moe_num_shared_experts: int = 2    # Shared experts (always active)
+    moe_num_shared_experts: int = 1    # Shared experts (always active)
     moe_num_routed_experts: int = 4    # Routed experts (top-k selected)
 
 args = Hyperparameters()
