@@ -1090,7 +1090,7 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20
 
     # MoE-specific hyperparameters
-    moe_aux_loss_weight: float = 0.001
+    moe_aux_loss_weight: float =  0.0  # Disable completely
     moe_num_experts: int = 4
 
 args = Hyperparameters()
@@ -1261,6 +1261,9 @@ def step_optimizers(step: int, optimizers, model):
     momentum = get_muon_momentum(step)
     for group in optimizers[1].param_groups:
         group["momentum"] = momentum
+
+    # ADD GRADIENT CLIPPING HERE
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     if step%2==0:
         optimizers[1].step()
