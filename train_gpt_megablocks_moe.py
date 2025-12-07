@@ -655,7 +655,7 @@ class MegaBlocksMoEMLP(nn.Module):
             else:
                 param.label = 'moe_expert'
 
-    @dynamo.disable
+    @dynamo.allow_in_graph
     def forward(self, x: Tensor):
         """
         Input: x [Batch, SeqLen, Dim] in BFloat16
@@ -795,7 +795,7 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ve = [value_embed(input_seq) for value_embed in list(self.value_embeds)]
         ve = [None, ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
 
