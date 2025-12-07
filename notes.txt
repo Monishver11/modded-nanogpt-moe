@@ -44,7 +44,9 @@ Now:
             - The training is bit stable, but for verification we need increase the # steps and see. If there are fluctuations, then we need to tweak params.
     - MegaBlocks
         - Batch_size = 4096 and working with torch.compile
-        - 
+        - step:12000/12000 val_loss:5.0546 train_time:2655375ms step_avg:221.28ms
+        - peak memory allocated: 10693 MiB reserved: 10850 MiB
+        - Loss is decreasing slowly, tweak the hyperparameters next.
 - Custom MoE kernels
 
 Impeding problems to solve:
