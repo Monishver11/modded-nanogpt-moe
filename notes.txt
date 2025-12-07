@@ -39,6 +39,10 @@ Now:
             - Fixes: Increase Aux Loss Weight + Add Router Gradient Clipping
             - There was graph breaks with torch.compile, so specifically disabled the MOEMLP forward for proper usage of triton kernels for the scatter-moe and all other operations with torch.compile.
             - Still the loss is diverging. Additional fixes to Scatter-MOE: Change to Top-1 Routing + Add Router Noise + Reduce Router Learning Rate 
+            - step:12000/12000 val_loss:4.5837 train_time:4081191ms step_avg:340.10ms
+            - peak memory allocated: 9319 MiB reserved: 9496 MiB
+            - The training is bit stable, but for verification we need increase the # steps and see. If there are fluctuations, then we need to tweak params.
+    - 
 - Custom MoE kernels
 
 Impeding problems to solve:
