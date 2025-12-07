@@ -638,7 +638,8 @@ class MegaBlocksMoEMLP(nn.Module):
             moe_normalize_expert_weights=1,
             mlp_impl="grouped",  # Required for Triton >= 3.2.0
             mlp_type="glu",      # GLU activation (not ReLU²)
-            bf16=True,
+            bf16=False,  # CHANGE FROM True TO False (use FP16 instead)
+            fp16=True,   
             device=torch.cuda.current_device(),
         )
         
