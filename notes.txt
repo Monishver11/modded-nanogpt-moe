@@ -43,7 +43,7 @@ Now:
             - peak memory allocated: 9319 MiB reserved: 9496 MiB
             - The training is bit stable, but for verification we need increase the # steps and see. If there are fluctuations, then we need to tweak params.
     - MegaBlocks
-        - Batch_size = 4096
+        - Batch_size = 4096 and working with torch.compile
         - 
 - Custom MoE kernels
 

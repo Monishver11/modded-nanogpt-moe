@@ -655,7 +655,7 @@ class MegaBlocksMoEMLP(nn.Module):
             else:
                 param.label = 'moe_expert'
 
-    @dynamo.allow_in_graph
+    @dynamo.disable
     def forward(self, x: Tensor):
         """
         Input: x [Batch, SeqLen, Dim] in BFloat16
