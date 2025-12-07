@@ -31,12 +31,21 @@ watch -n 1 nvidia-smi
 nvitop
 
 # Clone and install ScatterMoE (it needs to compile the Triton kernels)
-cd ..
+
 git clone https://github.com/shawntan/scattermoe
 cd scattermoe
 pip install -e .
 
 TORCH_LOGS="graph_breaks" python train_gpt_scatter_moe.py
 
+# Install MegaBlocks
+cd ..
+git clone https://github.com/stanford-futuredata/megablocks.git
+cd megablocks
+pip install -e .
+
+
+
+# git cmds;
 git pull --rebase origin scatter-moe-package
 git push
