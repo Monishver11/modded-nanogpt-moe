@@ -844,6 +844,8 @@ class GPT(nn.Module):
                 moe_layer_count += 1
                 total_aux_loss += aux_loss_dict['load_balancing_loss']
                 # MegaBlocks doesn't have router_z_loss, so skip it
+                print(f"Layer {i} aux_loss shape: {aux_loss_scalar.shape}")  # DEBUG
+                total_aux_loss += aux_loss_scalar
             
             if i < n:
                 skip_connections.append(x)
