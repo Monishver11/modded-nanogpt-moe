@@ -638,8 +638,8 @@ class MegaBlocksMoEMLP(nn.Module):
             moe_normalize_expert_weights=1,
             mlp_impl="grouped",
             mlp_type="glu",
-            bf16=False,
-            fp16=True,
+            bf16=True,
+            fp16=False,
             device=torch.cuda.current_device(),
         )
         
@@ -662,17 +662,16 @@ class MegaBlocksMoEMLP(nn.Module):
         """
         B, T, D = x.shape
         
-        # Convert BF16 -> FP16 for MegaBlocks compatibility
-        x_fp16 = x.to(torch.float16)
+        # REMOVE the FP16 casting
+        # x_fp16 = x.to(torch.float16) <--- DELETE
         
-        # MegaBlocks expects [SeqLen, Batch, Dim] format
-        x_transposed = x_fp16.transpose(0, 1)  # [T, B, D]
+        # MegaBlocks expects [SeqLen, Batch, Dim]
+        x_transposed = x.transpose(0, 1) # Keep in BF16
         
-        # Forward through MegaBlocks MoE
         output, aux_loss = self.moe(x_transposed)
         
-        # Transpose back [T, B, D] -> [B, T, D] and convert FP16 -> BF16
-        output = output.transpose(0, 1).to(torch.bfloat16)
+        # Transpose back
+        output = output.transpose(0, 1) # Output should already be BF16
         
         # CRITICAL FIX: Ensure aux_loss is scalar
         if aux_loss is not None and aux_loss.numel() > 1:
@@ -1160,10 +1159,10 @@ for m in model.modules():
         m.bfloat16()
 
 # Convert MegaBlocks modules to FP16 (must happen AFTER bfloat16 conversion)
-for m in model.modules():
-    if isinstance(m, MegaBlocksMoEMLP):
-        m.moe.half()
-        # print0(f"Converted MegaBlocks MoE to FP16", console=True)
+# for m in model.modules():
+#     if isinstance(m, MegaBlocksMoEMLP):
+#         m.moe.half()
+#         # print0(f"Converted MegaBlocks MoE to FP16", console=True)
 
 # ADD THIS DIAGNOSTIC CODE HERE
 print0("="*50, console=True)
@@ -1327,6 +1326,10 @@ for step in range(warmup_steps):
     loss = model(inputs, targets, cum_seqlens, ws_long//2, ws_long)
     # print0(f"Warmup step {step}, loss: {loss.item()}", console=True)  # Debug print
     loss.backward()
+
+    # --- ADD THIS BLOCK ---
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # ----------------------
     
     for opt in optimizers:
         opt.step()
