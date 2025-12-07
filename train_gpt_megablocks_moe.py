@@ -646,8 +646,7 @@ class MegaBlocksMoEMLP(nn.Module):
         # MegaBlocks MoE layer
         self.moe = moe.MoE(self.moe_args)
         
-        # Convert all MoE weights to FP16 (critical!)
-        self.moe.half()
+        # DON'T call .half() here - do it after model creation
         
         # Label parameters for optimizer
         for name, param in self.moe.named_parameters():
@@ -1140,13 +1139,18 @@ model: nn.Module = GPT(
     num_experts=args.moe_num_experts
 ).cuda()
 
-# Convert to bfloat16 (but skip MegaBlocks MoE which uses FP16)
+# Convert to bfloat16 (skip MegaBlocks modules)
 for m in model.modules():
-    # Skip MegaBlocks modules
     if isinstance(m, MegaBlocksMoEMLP):
-        continue
+        continue  # Skip MegaBlocks
     if isinstance(m, (nn.Embedding, nn.Linear)):
         m.bfloat16()
+
+# Convert MegaBlocks modules to FP16 (must happen AFTER bfloat16 conversion)
+for m in model.modules():
+    if isinstance(m, MegaBlocksMoEMLP):
+        m.moe.half()
+        print0(f"Converted MegaBlocks MoE to FP16", console=True)
 
 # Collect parameters for optimizers
 hidden_matrix_params = [p for n, p in model.blocks.named_parameters() 
