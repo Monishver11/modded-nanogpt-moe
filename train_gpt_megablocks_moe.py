@@ -655,7 +655,7 @@ class MegaBlocksMoEMLP(nn.Module):
             else:
                 param.label = 'moe_expert'
 
-    @torch.compile(disable=True)
+    @dynamo.disable
     def forward(self, x: Tensor):
         """
         Input: x [Batch, SeqLen, Dim] in BFloat16
@@ -1188,14 +1188,14 @@ gate_params = [p for n, p in model.named_parameters()
                if "gate" in n and id(p) not in moe_param_ids]
 
 # Debug: Print param counts
-print0(f"Parameter groups:", console=True)
-print0(f"  Router params: {len(router_params)}", console=True)
-print0(f"  Expert params: {len(expert_params)}", console=True)
-print0(f"  Hidden matrix params: {len(hidden_matrix_params)}", console=True)
-print0(f"  Embed params: {len(embed_params)}", console=True)
-print0(f"  Scalar params: {len(scalar_params)}", console=True)
-print0(f"  Head params: {len(head_params)}", console=True)
-print0(f"  Gate params: {len(gate_params)}", console=True)
+# print0(f"Parameter groups:", console=True)
+# print0(f"  Router params: {len(router_params)}", console=True)
+# print0(f"  Expert params: {len(expert_params)}", console=True)
+# print0(f"  Hidden matrix params: {len(hidden_matrix_params)}", console=True)
+# print0(f"  Embed params: {len(embed_params)}", console=True)
+# print0(f"  Scalar params: {len(scalar_params)}", console=True)
+# print0(f"  Head params: {len(head_params)}", console=True)
+# print0(f"  Gate params: {len(gate_params)}", console=True)
 
 # init the optimizer(s)
 optimizer1 = DistAdam([
@@ -1270,7 +1270,7 @@ def step_optimizers(step: int, optimizers, model):
 # Compile - MegaBlocks may not be fully compatible with torch.compile
 # Try without compilation first
 # Note: 'dynamic=False' is usually faster if your sequence length is constant during training
-model = torch.compile(model, mode="default", fullgraph=False)
+model = torch.compile(model, mode="default")
 
 ########################################
 #            Warmup kernels            #
