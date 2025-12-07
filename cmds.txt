@@ -58,6 +58,10 @@ pip install megablocks
 python -c "import stk; print('STK Version:', stk.__version__)"
 python -c "import megablocks.ops; print(True)"
 
+pip install git+https://github.com/tgale96/grouped_gemm@main
+python -c "import grouped_gemm; print('Grouped GEMM installed successfully!')"
+
+
 # Clear pip cache (often gigabytes)
 rm -rf ~/.cache/pip
 # Clear conda cache (if using conda)

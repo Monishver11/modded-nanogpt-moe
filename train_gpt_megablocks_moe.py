@@ -659,15 +659,16 @@ class MegaBlocksMoEMLP(nn.Module):
         """
         B, T, D = x.shape
         
-        # MegaBlocks expects [SeqLen * Batch, Dim] format
-        x_flat = x.view(B * T, D)
+        # MegaBlocks expects [SeqLen, Batch, Dim] format (NOT flattened!)
+        # Transpose from [B, T, D] to [T, B, D]
+        x_transposed = x.transpose(0, 1)  # [T, B, D]
         
         # Forward through MegaBlocks MoE
         # Returns (output, load_balancing_loss)
-        output, aux_loss = self.moe(x_flat)
+        output, aux_loss = self.moe(x_transposed)
         
-        # Reshape back to [Batch, SeqLen, Dim]
-        output = output.view(B, T, D)
+        # Transpose back from [T, B, D] to [B, T, D]
+        output = output.transpose(0, 1)
         
         # Create auxiliary loss dict
         aux_loss_dict = {
