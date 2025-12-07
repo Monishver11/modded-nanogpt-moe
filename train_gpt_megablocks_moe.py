@@ -655,21 +655,22 @@ class MegaBlocksMoEMLP(nn.Module):
     
     def forward(self, x: Tensor):
         """
-        Input: x [Batch, SeqLen, Dim]
+        Input: x [Batch, SeqLen, Dim] in BFloat16
         Returns: output, aux_loss_dict
         """
         B, T, D = x.shape
         
-        # MegaBlocks expects [SeqLen, Batch, Dim] format (NOT flattened!)
-        # Transpose from [B, T, D] to [T, B, D]
-        x_transposed = x.transpose(0, 1)  # [T, B, D]
+        # Convert BF16 -> FP16 for MegaBlocks
+        x_fp16 = x.to(torch.float16)
+        
+        # MegaBlocks expects [SeqLen, Batch, Dim] format
+        x_transposed = x_fp16.transpose(0, 1)  # [T, B, D]
         
         # Forward through MegaBlocks MoE
-        # Returns (output, load_balancing_loss)
         output, aux_loss = self.moe(x_transposed)
         
-        # Transpose back from [T, B, D] to [B, T, D]
-        output = output.transpose(0, 1)
+        # Transpose back and convert FP16 -> BF16
+        output = output.transpose(0, 1).to(torch.bfloat16)
         
         # Create auxiliary loss dict
         aux_loss_dict = {
