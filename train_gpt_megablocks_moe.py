@@ -1165,6 +1165,34 @@ for m in model.modules():
         m.moe.half()
         # print0(f"Converted MegaBlocks MoE to FP16", console=True)
 
+# ADD THIS DIAGNOSTIC CODE HERE
+print0("="*50, console=True)
+print0("Testing model with dummy input...", console=True)
+dummy_input = torch.randint(0, 50257, (1024,), device='cuda', dtype=torch.int32)
+dummy_target = torch.randint(0, 50257, (1024,), device='cuda', dtype=torch.int64)
+dummy_seqlens = torch.zeros(128, device='cuda', dtype=torch.int32)
+
+with torch.no_grad():
+    try:
+        test_loss = model(dummy_input, dummy_target, dummy_seqlens, 3, 7)
+        print0(f"Test loss: {test_loss.item()}", console=True)
+        if torch.isnan(test_loss):
+            print0("ERROR: Model produces NaN on random input!", console=True)
+            
+            # Check each MoE layer
+            print0("Checking MegaBlocks weights for NaN...", console=True)
+            for i, block in enumerate(model.blocks):
+                if hasattr(block, 'mlp') and isinstance(block.mlp, MegaBlocksMoEMLP):
+                    for name, param in block.mlp.named_parameters():
+                        if torch.isnan(param).any():
+                            print0(f"  Block {i} MoE param '{name}' contains NaN!", console=True)
+                        if torch.isinf(param).any():
+                            print0(f"  Block {i} MoE param '{name}' contains Inf!", console=True)
+    except Exception as e:
+        print0(f"ERROR during test forward pass: {e}", console=True)
+
+print0("="*50, console=True)
+
 # Collect parameters for optimizers - MUTUALLY EXCLUSIVE GROUPS
 # Step 1: Identify all MoE parameters first
 router_param_ids = {id(p) for n, p in model.named_parameters() if "router" in n}
