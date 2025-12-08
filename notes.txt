@@ -47,6 +47,10 @@ Now:
         - step:12000/12000 val_loss:5.0546 train_time:2655375ms step_avg:221.28ms
         - peak memory allocated: 10693 MiB reserved: 10850 MiB
         - Loss is decreasing slowly, tweak the hyperparameters next.
+- Deepseek MOE
+    - Reduced batch size = 2048, 1 shared expert, and 4 routed experts with Top2 (due to memory constraints)
+    - step:12000/12000 val_loss:4.7849 train_time:3726482ms step_avg:310.54ms
+    - peak memory allocated: 9917 MiB reserved: 11204 MiB
 - Custom MoE kernels (Current)
     - Brainstrom ideas from all above, and in comparison with SOTA architecture and models. Define the flow of computation and narrow down the bottlenecks and optimize them.
 
