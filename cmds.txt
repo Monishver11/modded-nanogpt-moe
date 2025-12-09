@@ -71,3 +71,60 @@ quota -s
 # git cmds;
 git pull --rebase origin scatter-moe-package
 git push
+
+
+# NYU A100 CPU Only Work
+
+ssh-keygen -R greene.hpc.nyu.edu 
+
+ssh mc10322@greene.hpc.nyu.edu
+
+ssh burst
+
+srun --account=csci_ga_3033-2025fa --partition=interactive --pty /bin/bash
+
+nvidia-smi
+
+cd /scratch/mc10322
+
+scp greene-dtn:/scratch/work/public/overlay-fs-ext3/overlay-25GB-500K.ext3.gz .
+
+gunzip -vvv ./overlay-25GB-500K.ext3.gz
+
+scp -rp greene-dtn:/scratch/work/public/singularity/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif .
+
+singularity exec --bind /scratch --nv --overlay  /scratch/mc10322/overlay-25GB-500K.ext3:rw /scratch/mc10322/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif /bin/bash
+
+cd /ext3/
+wget --no-check-certificate https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+sh Miniforge3-Linux-x86_64.sh -b -p /ext3/miniforge3
+
+touch /ext3/env.sh
+echo '#!/bin/bash' >> /ext3/env.sh
+echo 'unset -f which' >> /ext3/env.sh
+echo 'source /ext3/miniforge3/etc/profile.d/conda.sh' >> /ext3/env.sh
+echo 'export PATH=/ext3/miniforge3/bin:$PATH'         >> /ext3/env.sh
+echo 'export PYTHONPATH=/ext3/miniforge3/bin:$PATH'   >> /ext3/env.sh
+
+source /ext3/env.sh
+
+conda config --remove channels defaults
+conda update -n base conda -y
+conda clean --all --yes
+
+# NYU A100 GPU Only Work;
+
+srun --account=csci_ga_3033-2025fa --partition=c12m85-a100-1 --gres=gpu:1 --time=04:00:00 --pty /bin/bash
+
+cd /scratch/mc10322
+
+singularity exec \
+  --bind /scratch \
+  --nv \
+  --overlay /scratch/mc10322/overlay-25GB-500K.ext3:rw \
+  /scratch/mc10322/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif \
+  /bin/bash
+
+source /ext3/env.sh
+conda activate nanogpt
+
