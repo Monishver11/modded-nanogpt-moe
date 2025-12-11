@@ -72,6 +72,16 @@ quota -s
 git pull --rebase origin scatter-moe-package
 git push
 
+cd ..
+git clone git@github.com:Monishver11/deepseek_moe_fused_repo.git
+cd deepseek_moe_fused_repo/
+pip install -e .
+
+python -c "import deepseek_moe_fused; print('works')"
+
+pip uninstall -y deepseek_moe_fused
+
+
 
 # NYU A100 CPU Only Work
 
