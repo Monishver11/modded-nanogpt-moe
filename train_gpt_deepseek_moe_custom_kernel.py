@@ -766,7 +766,7 @@ class Block(nn.Module):
                     num_shared_experts=num_shared_experts,
                     num_routed_experts=num_routed_experts,
                     top_k=2,
-                    use_fused=False
+                    use_fused=True
                 )
             else:
                 self.mlp = MLP(dim)
