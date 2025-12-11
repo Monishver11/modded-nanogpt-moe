@@ -765,7 +765,8 @@ class Block(nn.Module):
                     dim, 
                     num_shared_experts=num_shared_experts,
                     num_routed_experts=num_routed_experts,
-                    top_k=2
+                    top_k=2,
+                    use_fused=True
                 )
             else:
                 self.mlp = MLP(dim)
@@ -1268,7 +1269,7 @@ def step_optimizers(step: int, optimizers, model):
         model.zero_grad(set_to_none=True)
 
 # Compile model
-model: nn.Module = torch.compile(model, dynamic=True, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=True)
 
 # Warmup kernels
 warmup_steps = 30
